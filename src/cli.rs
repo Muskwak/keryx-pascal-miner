@@ -4,12 +4,81 @@ use log::LevelFilter;
 use crate::Error;
 
 #[derive(Parser, Debug)]
-#[clap(name = "keryx-miner", version, about = "A Keryx high performance GPU miner with OPoI inference\n\nModel tiers (default: TinyLlama + DeepSeek-8B — RTX 3060 12GB / 3070 / 3080):\n  --light      RTX 3060 6GB or any GPU\n  (default)    RTX 3060 12GB / 3070 / 3080\n  --high       RTX 3090 / 4090 / 5090 (24GB+)\n  --very-high  RTX 5090 (32GB+)", term_width = 0)]
+#[clap(name = "keryx-miner", version, about = "A Keryx high performance GPU miner with OPoI inference\n\nModel tiers (default: TinyLlama + DeepSeek-8B — RTX 3060 12GB / 3070 / 3080):\n  --light      TinyLlama only — RTX 3060 6GB or any GPU\n  (default)    TinyLlama + DeepSeek-R1-8B — RTX 3060 12GB / 3070 / 3080\n  --high       + DeepSeek-R1-32B — RTX 3090 / 4090 (24GB+)\n  --very-high  + LLaMA-3.3-70B  — RTX 5090 (32GB+)", term_width = 0)]
 pub struct Opt {
+    // ── OPoI / Inference ─────────────────────────────────────────────────────
+
+    #[clap(
+        long = "light",
+        help = "Model tier: TinyLlama only — any GPU (6GB+ VRAM)",
+        help_heading = "OPoI / Inference",
+        conflicts_with_all = &["high", "very_high"]
+    )]
+    pub light: bool,
+
+    #[clap(
+        long = "high",
+        help = "Model tier: TinyLlama + DeepSeek-R1-8B + DeepSeek-R1-32B — RTX 3090 / 4090 (24GB+)",
+        help_heading = "OPoI / Inference",
+        conflicts_with_all = &["light", "very_high"]
+    )]
+    pub high: bool,
+
+    #[clap(
+        long = "very-high",
+        help = "Model tier: TinyLlama + DeepSeek-R1-8B + DeepSeek-R1-32B + LLaMA-3.3-70B — RTX 5090 (32GB+)",
+        help_heading = "OPoI / Inference",
+        conflicts_with_all = &["light", "high"]
+    )]
+    pub very_high: bool,
+
+    #[clap(
+        long = "ipfs-url",
+        help = "IPFS Kubo API URL for uploading inference results",
+        help_heading = "OPoI / Inference",
+        default_value = "http://127.0.0.1:5001"
+    )]
+    pub ipfs_url: String,
+
+    #[clap(
+        long = "escrow-key-file",
+        help = "Path to the OPoI escrow private key file (auto-generated if absent)",
+        help_heading = "OPoI / Inference",
+        default_value = "escrow.key"
+    )]
+    pub escrow_key_file: String,
+
+    #[clap(
+        long = "escrow-state-file",
+        help = "Path to the escrow claim state file",
+        help_heading = "OPoI / Inference",
+        default_value = "escrow_state.json"
+    )]
+    pub escrow_state_file: String,
+
+    #[clap(
+        long = "recover-escrow",
+        help = "Rebuild escrow_state.json by querying the Keryx public API. Exits after recovery.",
+        help_heading = "OPoI / Inference"
+    )]
+    pub recover_escrow: bool,
+
+    #[clap(
+        long = "recover-escrow-api",
+        help = "Base URL of the Keryx API to use for escrow recovery",
+        help_heading = "OPoI / Inference",
+        default_value = "https://keryx-labs.com"
+    )]
+    pub recover_escrow_api: String,
+
+    // ── Mining ────────────────────────────────────────────────────────────────
+
     #[clap(short, long, help = "Enable debug logging level")]
     pub debug: bool,
+
     #[clap(short = 'a', long = "mining-address", help = "The Keryx address for the miner reward")]
     pub mining_address: Option<String>,
+
     #[clap(short = 's', long = "keryxd-address", default_value = "127.0.0.1", help = "The IP of the keryxd instance")]
     pub keryxd_address: String,
 
@@ -21,69 +90,16 @@ pub struct Opt {
 
     #[clap(long, help = "Use testnet instead of mainnet [default: false]")]
     testnet: bool,
+
     #[clap(short = 't', long = "threads", help = "Amount of CPU miner threads to launch [default: 0]")]
     pub num_threads: Option<u16>,
+
     #[clap(
         long = "mine-when-not-synced",
         help = "Mine even when keryxd says it is not synced",
         long_help = "Mine even when keryxd says it is not synced, only useful when passing `--allow-submit-block-when-not-synced` to keryxd  [default: false]"
     )]
     pub mine_when_not_synced: bool,
-
-    #[clap(
-        long = "escrow-key-file",
-        help = "Path to the OPoI escrow private key file (auto-generated if absent)",
-        default_value = "escrow.key"
-    )]
-    pub escrow_key_file: String,
-
-    #[clap(
-        long = "escrow-state-file",
-        help = "Path to the escrow claim state file",
-        default_value = "escrow_state.json"
-    )]
-    pub escrow_state_file: String,
-
-    #[clap(
-        long = "recover-escrow",
-        help = "Rebuild escrow_state.json by querying the Keryx public API. Exits after recovery."
-    )]
-    pub recover_escrow: bool,
-
-    #[clap(
-        long = "recover-escrow-api",
-        help = "Base URL of the Keryx API to use for escrow recovery",
-        default_value = "https://keryx-labs.com"
-    )]
-    pub recover_escrow_api: String,
-
-    #[clap(
-        long = "light",
-        help = "Model tier: TinyLlama only — RTX 3060 6GB or any GPU",
-        conflicts_with_all = &["high", "very_high"]
-    )]
-    pub light: bool,
-
-    #[clap(
-        long = "high",
-        help = "Model tier: TinyLlama + DeepSeek-R1-8B + DeepSeek-R1-32B — RTX 3090 / 4090 / 5090 (24GB+)",
-        conflicts_with_all = &["light", "very_high"]
-    )]
-    pub high: bool,
-
-    #[clap(
-        long = "very-high",
-        help = "Model tier: all 4 models + LLaMA-3.3-70B — RTX 5090 (32GB+)",
-        conflicts_with_all = &["light", "high"]
-    )]
-    pub very_high: bool,
-
-    #[clap(
-        long = "ipfs-url",
-        help = "IPFS Kubo API URL for uploading inference results",
-        default_value = "http://127.0.0.1:5001"
-    )]
-    pub ipfs_url: String,
 
     #[clap(skip)]
     pub devfund_address: String,
