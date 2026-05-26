@@ -5,3 +5,4 @@ escrow.key
 escrow_state.json
 .env
 
+target-hive/
