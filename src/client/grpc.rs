@@ -80,10 +80,30 @@ impl Client for KeryxdHandler {
     }
 
     async fn listen(&mut self, miner: &mut MinerManager) -> Result<(), Error> {
-        while let Some(msg) = self.stream.message().await? {
-            match msg.payload {
-                Some(payload) => self.handle_message(payload, miner).await?,
-                None => warn!("keryxd message payload is empty"),
+        // Harvest in-flight inference on a timer, independently of node notifications.
+        // On a sole-producer node, pausing mining for inference stops block production,
+        // so the node stops sending NewBlockTemplate notifications — without this timer
+        // the finished inference would never be collected and mining would deadlock.
+        let mut tick = tokio::time::interval(tokio::time::Duration::from_millis(200));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            let maybe_msg = tokio::select! {
+                msg = self.stream.message() => Some(msg?),
+                _ = tick.tick() => None,
+            };
+            match maybe_msg {
+                Some(Some(m)) => match m.payload {
+                    Some(payload) => self.handle_message(payload, miner).await?,
+                    None => warn!("keryxd message payload is empty"),
+                },
+                Some(None) => break, // stream closed by node
+                None => {
+                    // Timer tick: if an inference just finished (or its task died),
+                    // request a fresh template to resume mining immediately.
+                    if self.inference_rx.is_some() && self.poll_inference().await {
+                        self.client_get_block_template().await?;
+                    }
+                }
             }
         }
         Ok(())
@@ -260,17 +280,75 @@ impl KeryxdHandler {
                     self.ai_seen_prefixes.insert(stable_id.clone());
                     self.ai_request_queue.push_back((stable_id.clone(), raw, model_id, prompt, max_tokens));
                 }
-                // Track txid for escrow claims (only for confirmed TXs with a non-empty txid).
+                // Track txid for escrow claims. Prefer verbose_data.transaction_id when
+                // present, fall back to computing the txid from the transaction fields —
+                // verbose_data is not populated for non-coinbase transactions in block
+                // template or block notifications, so without this fallback the escrow
+                // outpoint is never tracked and the inference_reward is never claimed.
                 if inference_reward > 0 {
-                    if let Some(txid) = tx.verbose_data.as_ref()
+                    let txid_opt = tx.verbose_data.as_ref()
                         .map(|v| v.transaction_id.clone())
                         .filter(|id| !id.is_empty())
-                    {
+                        .or_else(|| Self::compute_rpc_txid(tx));
+                    if let Some(txid) = txid_opt {
                         self.ai_request_txids.insert(stable_id, (txid, inference_reward));
                     }
                 }
             }
         }
+    }
+
+    /// Compute the Kaspa transaction ID for a non-coinbase RpcTransaction.
+    ///
+    /// Mirrors keryx-node consensus/core/src/hashing/tx.rs `id()` with
+    /// EXCLUDE_SIGNATURE_SCRIPT | EXCLUDE_MASS_COMMIT flags (standard for non-coinbase txs).
+    ///
+    /// Serialization: blake2b-256 keyed "TransactionID" over:
+    ///   version(u16 LE) | inputs_count(u64 LE) | inputs... | outputs_count(u64 LE) | outputs...
+    ///   | lock_time(u64 LE) | subnetwork_id(20B) | gas(u64 LE) | payload_len(u64 LE) | payload
+    ///
+    /// For each input (sig script excluded): txid(32B) | index(u32 LE) | 0u64(empty var_bytes) | seq(u64 LE)
+    /// For each output: amount(u64 LE) | spk_version(u16 LE) | script_len(u64 LE) | script
+    fn compute_rpc_txid(tx: &crate::proto::RpcTransaction) -> Option<String> {
+        const KEY: &[u8] = b"TransactionID";
+        let mut h = blake2b_simd::Params::new().hash_length(32).key(KEY).to_state();
+
+        h.update(&(tx.version as u16).to_le_bytes());
+        h.update(&(tx.inputs.len() as u64).to_le_bytes());
+        for input in &tx.inputs {
+            let prev = input.previous_outpoint.as_ref()?;
+            let txid_bytes = hex::decode(&prev.transaction_id).ok()?;
+            if txid_bytes.len() != 32 {
+                return None;
+            }
+            h.update(&txid_bytes);
+            h.update(&prev.index.to_le_bytes());
+            h.update(&0u64.to_le_bytes()); // write_var_bytes(&[]) — empty sig script
+            h.update(&input.sequence.to_le_bytes());
+        }
+
+        h.update(&(tx.outputs.len() as u64).to_le_bytes());
+        for output in &tx.outputs {
+            h.update(&output.amount.to_le_bytes());
+            let spk = output.script_public_key.as_ref()?;
+            h.update(&(spk.version as u16).to_le_bytes());
+            let script = hex::decode(&spk.script_public_key).ok()?;
+            h.update(&(script.len() as u64).to_le_bytes());
+            h.update(&script);
+        }
+
+        h.update(&tx.lock_time.to_le_bytes());
+        let subnet = hex::decode(&tx.subnetwork_id).ok()?;
+        if subnet.len() != 20 {
+            return None;
+        }
+        h.update(&subnet);
+        h.update(&tx.gas.to_le_bytes());
+        let payload = hex::decode(&tx.payload).ok()?;
+        h.update(&(payload.len() as u64).to_le_bytes());
+        h.update(&payload);
+
+        Some(hex::encode(h.finalize().as_bytes()))
     }
 
     /// Parses a `KRX:AI:1:` JSON payload, returning `(model_name, prompt, max_tokens)`.

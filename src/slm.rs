@@ -246,6 +246,12 @@ fn format_prompt(engine: &SlmEngine, prompt: &str) -> String {
     }
 }
 
+/// Repetition penalty applied over a recent token window before sampling.
+/// Breaks degenerate loops where the model repeats a phrase instead of emitting EOS
+/// (common on distilled R1 models). 1.0 = disabled.
+const REPEAT_PENALTY: f32 = 1.15;
+const REPEAT_LAST_N: usize = 64;
+
 fn generate(engine: &mut SlmEngine, prompt: &str, max_new_tokens: usize) -> Result<String> {
     let formatted = format_prompt(engine, prompt);
     let enc = engine.tokenizer.encode(formatted.as_str(), true)
@@ -276,7 +282,7 @@ fn generate(engine: &mut SlmEngine, prompt: &str, max_new_tokens: usize) -> Resu
                     .map_err(|e| anyhow!("input tensor: {}", e))?;
                 let logits = model.forward(&input, pos, &mut cache)
                     .map_err(|e| anyhow!("forward: {}", e))?;
-                let next = sample_next(&logits, &mut lp)?;
+                let next = sample_next(&logits, &mut lp, &all_tokens)?;
                 if next == engine.eos_token_id { break; }
                 all_tokens.push(next);
                 generated.push(next);
@@ -295,7 +301,7 @@ fn generate(engine: &mut SlmEngine, prompt: &str, max_new_tokens: usize) -> Resu
                     .map_err(|e| anyhow!("input tensor: {}", e))?;
                 let logits = model.forward(&input, pos)
                     .map_err(|e| anyhow!("forward: {}", e))?;
-                let next = sample_next(&logits, &mut lp)?;
+                let next = sample_next(&logits, &mut lp, &all_tokens)?;
                 if next == engine.eos_token_id { break; }
                 all_tokens.push(next);
                 generated.push(next);
@@ -314,7 +320,7 @@ fn generate(engine: &mut SlmEngine, prompt: &str, max_new_tokens: usize) -> Resu
                     .map_err(|e| anyhow!("input tensor: {}", e))?;
                 let logits = model.forward(&input, pos)
                     .map_err(|e| anyhow!("forward: {}", e))?;
-                let next = sample_next(&logits, &mut lp)?;
+                let next = sample_next(&logits, &mut lp, &all_tokens)?;
                 if next == engine.eos_token_id { break; }
                 all_tokens.push(next);
                 generated.push(next);
@@ -327,13 +333,22 @@ fn generate(engine: &mut SlmEngine, prompt: &str, max_new_tokens: usize) -> Resu
         .map_err(|e| anyhow!("decode: {}", e))
 }
 
-fn sample_next(logits: &Tensor, lp: &mut LogitsProcessor) -> Result<u32> {
+fn sample_next(logits: &Tensor, lp: &mut LogitsProcessor, context: &[u32]) -> Result<u32> {
     let dims = logits.dims();
     let last = match dims.len() {
         3 => logits.narrow(1, dims[1] - 1, 1)?.squeeze(1)?.squeeze(0)?,
         2 => logits.narrow(0, dims[0] - 1, 1)?.squeeze(0)?,
         1 => logits.clone(),
         _ => return Err(anyhow!("unexpected logits shape {:?}", dims)),
+    };
+    // Penalize recently-generated tokens to break degenerate repetition loops.
+    let last = if REPEAT_PENALTY != 1.0 && !context.is_empty() {
+        let start = context.len().saturating_sub(REPEAT_LAST_N);
+        let f32_logits = last.to_dtype(DType::F32).map_err(|e| anyhow!("logits dtype: {}", e))?;
+        candle_transformers::utils::apply_repeat_penalty(&f32_logits, REPEAT_PENALTY, &context[start..])
+            .map_err(|e| anyhow!("repeat penalty: {}", e))?
+    } else {
+        last
     };
     lp.sample(&last).map_err(|e| anyhow!("sample: {}", e))
 }

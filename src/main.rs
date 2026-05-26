@@ -87,16 +87,16 @@ fn check_gpu_power_limit(needs_high: bool, needs_very_high: bool) {
         ])
         .output();
 
-    let (current_w, max_w, vram_mb) = match output {
+    let (current_w, vram_mb) = match output {
         Ok(o) if o.status.success() => {
             let s = String::from_utf8_lossy(&o.stdout);
             let mut parts = s.trim().split(',');
             let cur: f32 = parts.next().unwrap_or("0").trim().parse().unwrap_or(0.0);
-            let max: f32 = parts.next().unwrap_or("0").trim().parse().unwrap_or(0.0);
+            let _max: f32 = parts.next().unwrap_or("0").trim().parse().unwrap_or(0.0);
             let vram: u64 = parts.next().unwrap_or("0").trim().parse().unwrap_or(0);
-            (cur as u32, max as u32, vram)
+            (cur as u32, vram)
         }
-        _ => return, // nvidia-smi unavailable — skip silently (non-NVIDIA or no driver)
+        _ => return,
     };
 
     // VRAM check for 70B: 28 GB weights + ~2.5 GB KV cache → requires ≥32 GB card (RTX 5090+).
@@ -114,32 +114,14 @@ fn check_gpu_power_limit(needs_high: bool, needs_very_high: bool) {
         // Non-fatal: let candle fail with its own OOM so the miner logs the actual error.
     }
 
-    // Power limit check — low PL causes CUDA FIFO instability (Xid 32) under GEMM peaks.
-    let (min_pl, model_label) = if needs_very_high {
-        (360u32, "LLaMA-3.3-70B (--very-high)")
+    let model_label = if needs_very_high {
+        "LLaMA-3.3-70B (--very-high)"
     } else if needs_high {
-        (340u32, "DeepSeek-R1-32B (--high)")
+        "DeepSeek-R1-32B (--high)"
     } else {
-        (250u32, "DeepSeek-R1-8B (default)")
+        "DeepSeek-R1-8B (default)"
     };
-
-    if current_w < min_pl {
-        log::warn!(
-            "⚠️  GPU power limit is {}W — minimum recommended for {} is {}W.",
-            current_w, model_label, min_pl
-        );
-        log::warn!("   Low PL causes CUDA FIFO instability (Xid 32) during large matrix operations.");
-        log::warn!(
-            "   Run: sudo nvidia-smi -pl {}  (card max: {}W)",
-            min_pl, max_w
-        );
-        log::warn!("   To persist across reboots: enable nvidia-power-limit.service");
-    } else {
-        log::info!(
-            "GPU: {}W PL ✓, {} MB VRAM — ready for {}",
-            current_w, vram_mb, model_label
-        );
-    }
+    log::info!("GPU: {}W PL, {} MB VRAM — ready for {}", current_w, vram_mb, model_label);
 }
 
 async fn get_client(
