@@ -13,7 +13,7 @@ use futures_util::StreamExt;
 use log::{error, info, warn};
 use rand::{thread_rng, RngCore};
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc::{self, error::SendError, Sender}, oneshot};
 use tokio::task::JoinHandle;
@@ -59,6 +59,9 @@ pub struct KeryxdHandler {
     /// When the result arrives, it is sent back via inference_result in the next GetBlockTemplateRequest.
     challenge_inference_rx: Option<(String, oneshot::Receiver<Option<String>>)>,
 
+    /// Shared flag with MinerManager — suppresses GPU stall warnings during OPoI inference.
+    opoi_challenge_active: Option<Arc<AtomicBool>>,
+
     /// Last DAA score seen in a block template — used to compute challenge_window_end.
     last_known_daa: u64,
 
@@ -86,6 +89,7 @@ impl Client for KeryxdHandler {
     }
 
     async fn listen(&mut self, miner: &mut MinerManager) -> Result<(), Error> {
+        self.opoi_challenge_active = Some(miner.opoi_challenge_flag());
         // Harvest in-flight inference on a timer, independently of node notifications.
         // On a sole-producer node, pausing mining for inference stops block production,
         // so the node stops sending NewBlockTemplate notifications — without this timer
@@ -180,6 +184,7 @@ impl KeryxdHandler {
             ai_request_txids: std::collections::HashMap::new(),
             inference_rx: None,
             challenge_inference_rx: None,
+            opoi_challenge_active: None,
             last_known_daa: 0,
             ipfs_url,
             escrow_pubkey,
@@ -247,11 +252,17 @@ impl KeryxdHandler {
                     let model_id_hex = parts.next().unwrap_or("");
                     let nonce_hex_c  = parts.next().unwrap_or("");
                     info!("OPoI: sending challenge response model={:.8}", model_id_hex);
+                    if let Some(flag) = &self.opoi_challenge_active {
+                        flag.store(false, Ordering::Relaxed);
+                    }
                     // Response format: "model_id_hex:nonce_hex:result_text"
                     format!("{}:{}:{}", model_id_hex, nonce_hex_c, text)
                 }
                 Ok(None) => {
                     warn!("OPoI: challenge inference failed — sending empty result, node will re-challenge");
+                    if let Some(flag) = &self.opoi_challenge_active {
+                        flag.store(false, Ordering::Relaxed);
+                    }
                     String::new()
                 }
                 Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
@@ -260,6 +271,9 @@ impl KeryxdHandler {
                 }
                 Err(_) => {
                     warn!("OPoI: challenge inference task dropped — sending empty result");
+                    if let Some(flag) = &self.opoi_challenge_active {
+                        flag.store(false, Ordering::Relaxed);
+                    }
                     String::new()
                 }
             },
@@ -551,6 +565,9 @@ impl KeryxdHandler {
                             model_id.copy_from_slice(&model_id_bytes);
                             if keryx_miner::slm::is_model_ready(&model_id) {
                                 info!("OPoI: challenge received model={:.8} nonce={:.8} — spawning inference", model_id_hex, nonce_hex);
+                                if let Some(flag) = &self.opoi_challenge_active {
+                                    flag.store(true, Ordering::Relaxed);
+                                }
                                 let prompt = format!("Keryx inference challenge {}: briefly describe what you are.", nonce_hex);
                                 let (tx_done, rx_done) = oneshot::channel::<Option<String>>();
                                 tokio::task::spawn_blocking(move || {
