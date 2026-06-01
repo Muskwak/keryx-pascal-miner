@@ -426,20 +426,27 @@ impl StratumHandler {
                             self.block_template_ctr
                                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some((v + 1) % 10_000))
                                 .unwrap();
-                            self.handle_ai_task(id.clone(), task_json).await;
-                            miner
-                                .process_block(Some(PartialBlock {
-                                    id,
-                                    header_hash,
-                                    timestamp,
-                                    daa_score,
-                                    nonce: 0,
-                                    target: self.target_pool,
-                                    nonce_mask: self.nonce_mask,
-                                    nonce_fixed: self.nonce_fixed,
-                                    hash: None,
-                                }))
-                                .await
+                            let inference_started =
+                                self.handle_ai_task(id.clone(), task_json, miner).await;
+                            if inference_started {
+                                // PoW already paused inside handle_ai_task — do NOT feed a new
+                                // block template or the GPU immediately resumes hashing.
+                                Ok(())
+                            } else {
+                                miner
+                                    .process_block(Some(PartialBlock {
+                                        id,
+                                        header_hash,
+                                        timestamp,
+                                        daa_score,
+                                        nonce: 0,
+                                        target: self.target_pool,
+                                        nonce_mask: self.nonce_mask,
+                                        nonce_fixed: self.nonce_fixed,
+                                        hash: None,
+                                    }))
+                                    .await
+                            }
                         }
                         StratumCommand::MiningNotify(MiningNotify::MiningNotifyShortV2((
                             id,
@@ -636,13 +643,16 @@ impl StratumHandler {
     }
 
     /// Parse the task JSON from a `MiningNotifyWithTask`, store it in `current_task_slot`,
-    async fn handle_ai_task(&mut self, job_id: String, task_json: String) {
+    /// Handles an AiTask dispatched by the bridge. Returns `true` if inference was launched
+    /// and PoW has been paused — the caller must NOT call `process_block(Some(...))` in that
+    /// case; PoW resumes automatically on the next `mining.notify` after inference completes.
+    async fn handle_ai_task(&mut self, job_id: String, task_json: String, miner: &mut MinerManager) -> bool {
         let task: AiTask = match serde_json::from_str(&task_json) {
             Ok(t) => t,
             Err(e) => {
                 warn!("OPoI: failed to parse task JSON from bridge: {}", e);
                 *self.current_task_slot.lock().await = None;
-                return;
+                return false;
             }
         };
 
@@ -651,14 +661,14 @@ impl StratumHandler {
 
         // Skip inference if stable_id is missing (malformed task) or already done/running.
         if task.stable_id.is_empty() {
-            return;
+            return false;
         }
         let already_handled = {
             let cache = self.inference_cache.lock().await;
             cache.results.contains_key(&task.stable_id) || cache.in_progress.contains(&task.stable_id)
         };
         if already_handled {
-            return;
+            return false;
         }
 
         // Decode model_id hex and check it is ready on disk.
@@ -666,7 +676,7 @@ impl StratumHandler {
             Ok(b) if b.len() == 32 => b,
             _ => {
                 warn!("OPoI [{}]: invalid model_id_hex '{}'", task.stable_id, task.model_id_hex);
-                return;
+                return false;
             }
         };
         let mut model_id = [0u8; 32];
@@ -674,8 +684,20 @@ impl StratumHandler {
 
         if !keryx_miner::slm::is_model_ready(&model_id) {
             warn!("OPoI [{}]: model not ready — inference skipped", task.stable_id);
-            return;
+            return false;
         }
+
+        // Guard against two concurrent inferences (challenge may already hold the GPU).
+        if self.challenge_in_flight.swap(true, Ordering::SeqCst) {
+            warn!("OPoI AiTask [{}]: inference already in flight, skipping", task.stable_id);
+            return false;
+        }
+
+        // Pause PoW — running kHeavyHash and SLM inference simultaneously crashes the GPU.
+        let miner_flag = miner.opoi_challenge_flag();
+        miner_flag.store(true, Ordering::SeqCst);
+        miner.process_block(None).await.ok();
+        info!("OPoI AiTask [{}]: PoW suspended for GPU inference", task.stable_id);
 
         // Mark in-progress and spawn the blocking inference + IPFS upload.
         {
@@ -687,10 +709,16 @@ impl StratumHandler {
         let max_tokens = task.max_tokens;
         let ipfs_url = self.ipfs_url.clone();
         let cache_ref = Arc::clone(&self.inference_cache);
+        let challenge_flag = Arc::clone(&self.challenge_in_flight);
 
         tokio::task::spawn_blocking(move || {
             run_inference_and_upload(model_id, prompt, max_tokens, ipfs_url, stable_id, cache_ref);
+            // Clear both flags — PoW resumes on the next mining.notify from the bridge.
+            miner_flag.store(false, Ordering::SeqCst);
+            challenge_flag.store(false, Ordering::SeqCst);
         });
+
+        true
     }
 }
 
