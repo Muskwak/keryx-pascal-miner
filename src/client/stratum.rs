@@ -282,7 +282,7 @@ impl StratumHandler {
                 .unwrap_or_else(|| Arc::new(AtomicU16::new((thread_rng().next_u64() % 10_000u64) as u16))),
             target_pool: Default::default(),
             target_real: Default::default(),
-            nonce_mask: 0,
+            nonce_mask: u64::MAX, // full nonce space until set_extranonce assigns a sub-range
             nonce_fixed: 0,
             extranonce: None,
             last_stratum_id,
@@ -510,8 +510,12 @@ impl StratumHandler {
                 let jobid = { self.shares_stats.shares_pending.try_lock().unwrap().remove(&id) }.unwrap();
                 match code {
                     ErrorCode::Unknown => {
-                        error!("Got error code {}: {}", code, error);
-                        Err(error.into())
+                        // Match solo-mining behaviour (grpc.rs SubmitBlockResponse): a rejected
+                        // share/block is logged but never fatal. Returning Err here tore down the
+                        // whole connection and caused an infinite reconnect loop on every share.
+                        self.shares_stats.low_diff.fetch_add(1, Ordering::SeqCst);
+                        warn!("Share rejected by pool (Job id: {:?}): {}", jobid, error);
+                        Ok(())
                     }
                     ErrorCode::JobNotFound => {
                         self.shares_stats.stale.fetch_add(1, Ordering::SeqCst);
