@@ -16,6 +16,7 @@ static BPS: f32 = 1.;
 static PTX_100: &str = include_str!("../resources/keryx-cuda-sm100.ptx");
 static PTX_89: &str = include_str!("../resources/keryx-cuda-sm89.ptx");
 static PTX_86: &str = include_str!("../resources/keryx-cuda-sm86.ptx");
+static PTX_80: &str = include_str!("../resources/keryx-cuda-sm80.ptx");
 static PTX_75: &str = include_str!("../resources/keryx-cuda-sm75.ptx");
 static PTX_61: &str = include_str!("../resources/keryx-cuda-sm61.ptx");
 // sm_30 (Kepler) and sm_20 (Fermi) dropped: CUDA 12+ no longer compiles for
@@ -201,6 +202,22 @@ impl<'gpu> CudaGPUWorker<'gpu> {
         } else if major == 8 && minor >= 6 {
             // sm_86 (RTX 30 / Ampere)
             _module = Arc::new(load_ptx(PTX_86, "sm_86")?);
+        } else if major == 8 {
+            // sm_80 (A100 / CMP 170HX, data-center Ampere). Reaching here means minor < 6
+            // (sm_86+ and sm_89+ are caught above). The sm_86 PTX would NOT load on sm_80
+            // because a PTX .target is a *minimum* compute capability, so we ship a native
+            // sm_80 PTX. If the driver is too old for its PTX ISA, fall back to sm_75, which
+            // runs on sm_80 and up via the backward-compatible PTX JIT.
+            _module = Arc::new(match load_ptx(PTX_80, "sm_80") {
+                Ok(m) => {
+                    info!("GPU #{} using optimised sm_80 PTX", device_id);
+                    m
+                }
+                Err(e) => {
+                    info!("GPU #{} falling back to sm_75 PTX (update driver for native sm_80)", device_id);
+                    load_ptx(PTX_75, "sm_75 (fallback)").map_err(|_| e)?
+                }
+            });
         } else if major > 7 || (major == 7 && minor >= 5) {
             // sm_75 (RTX 20 / Turing)
             _module = Arc::new(Module::from_ptx(PTX_75, &[ModuleJitOption::OptLevel(OptLevel::O4)]).map_err(|e| {
