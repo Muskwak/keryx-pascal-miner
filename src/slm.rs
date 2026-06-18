@@ -826,6 +826,11 @@ fn generate(engine: &mut SlmEngine, prompt: &str, max_new_tokens: usize) -> Resu
             }
         }
         ModelInner::QuantizedQwen3(model) => {
+            // Reset the KV cache: candle's quantized_qwen3 uses a ConcatKvCache that appends
+            // on every forward without honoring the offset, so without this each inference
+            // would attend to the previous request's residual keys (k_len = stale + seq → the
+            // "shape mismatch in broadcast_add" seen on Qwen3-32B).
+            model.clear_kv_cache();
             for step in 0..max_steps {
                 let (input_ids, pos) = if step == 0 {
                     (all_tokens.as_slice(), 0usize)

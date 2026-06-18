@@ -317,6 +317,14 @@ impl ModelWeights {
         }
     }
 
+    /// Reset every layer's KV cache. Must be called before each independent prompt so a
+    /// new inference doesn't attend to the previous request's residual keys/values.
+    pub fn clear_kv_cache(&mut self) {
+        for layer in &mut self.layers {
+            layer.kv_cache = None;
+        }
+    }
+
     pub fn forward(&mut self, x: &Tensor, index_pos: usize) -> Result<Tensor> {
         let (_b_sz, seq_len) = x.dims2()?;
         let masks: Vec<Option<Tensor>> = if seq_len == 1 {
