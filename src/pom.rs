@@ -17,6 +17,10 @@ use candle_core::Device;
 pub const CHUNK_WORDS: usize = 4; // 32 B chunk
 const SEED_SALT: u64 = 0x4B65727978500; // "KeryxP"
 
+/// Walk length / opening count — MUST match the node's `POM_WALK_STEPS` / `POM_OPENINGS`.
+pub const POM_WALK_STEPS: u32 = 1024;
+pub const POM_OPENINGS: usize = 32;
+
 // --- wire structs (field order == node's PomOpening/PomProof) ---
 
 #[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
@@ -100,7 +104,7 @@ fn hash_pair(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
     blake(&buf)
 }
 
-fn le_leq(a: &[u8; 32], b: &[u8; 32]) -> bool {
+pub fn le_leq(a: &[u8; 32], b: &[u8; 32]) -> bool {
     for i in (0..32).rev() {
         if a[i] < b[i] {
             return true;
