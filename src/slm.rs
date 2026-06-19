@@ -236,8 +236,13 @@ fn download_file(url: &str, dest: &std::path::Path) -> Result<()> {
         }
         let _ = file.flush();
 
-        // Done only if the stream ended cleanly AND we reached the known total.
-        let complete = stream_err.is_none() && total.map_or(true, |t| downloaded >= t);
+        // Done only if the stream ended cleanly AND we reached the known total. An unknown
+        // total (chunked IPFS-gateway response with no Content-Length/Content-Range) must NOT
+        // count as complete: a clean early EOF would otherwise mark a truncated GGUF as done,
+        // write the `.ok` sentinel, and let the miner start on a partial model (failing every
+        // challenge). Treat unknown-total as incomplete and retry — a fresh Range request
+        // usually returns a parsable Content-Range and self-heals.
+        let complete = stream_err.is_none() && matches!(total, Some(t) if downloaded >= t);
         if complete {
             eprintln!();
             return Ok(());
