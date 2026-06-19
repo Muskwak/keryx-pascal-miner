@@ -471,8 +471,13 @@ async fn main() -> Result<(), Error> {
     // hot-swaps without a restart:
     //   - legacy (daa < H) is prefetched now and mined immediately;
     //   - uncensored (daa >= H) is prefetched in the background and swapped in at H.
+    // LOCAL TESTNET BUILD ONLY — do NOT ship/commit. The chain is already past
+    // OPOI_V2_ACTIVATION_DAA, so the legacy (V1) lineup would be downloaded but never
+    // used. Point the "current" lineup at V2 too so only the 4 uncensored models are
+    // fetched (saves SSD space). Revert this `OPOI_V2_ACTIVATION_DAA` back to `0` for
+    // any real release.
     let specs_v1 = filter_specs_by_vram(
-        keryx_miner::models::specs_for(0, tier),
+        keryx_miner::models::specs_for(keryx_miner::models::OPOI_V2_ACTIVATION_DAA, tier),
         opt.vram_pool,
         opt.cpu_inference,
     );
