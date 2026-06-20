@@ -15,8 +15,9 @@
 //! - No tracing spans, no Metal SDPA fast path (Keryx miners are CUDA/CPU).
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
-use candle_core::quantized::{gguf_file, QMatMul};
+use candle_core::quantized::{gguf_file, QMatMul, QTensor};
 use candle_core::{DType, Device, IndexOp, Result, Tensor};
 use candle_nn::{Embedding, Module};
 use candle_transformers::quantized_nn::RmsNorm;
@@ -287,6 +288,41 @@ impl ModelWeights {
             masks: HashMap::new(),
             devices: devices.to_vec(),
         })
+    }
+
+    /// PoM zero-dup support: the quantized weight matrices held resident in VRAM, keyed by their
+    /// canonical GGUF name (the QMatMul-backed tensors keep candle's raw quantized bytes == what
+    /// `R_T` commits). Dequantized tensors (token_embd, norms) are not returned — the PoM loader
+    /// reads those raw. Additive accessor: touches neither loading nor the forward. (Parallel of
+    /// the qwen3 split; llama-arch GGUF tensor names are identical, so this also covers Llama-70B.)
+    pub fn pom_quant_tensors(&self) -> HashMap<String, Arc<QTensor>> {
+        fn inner(qmm: &QMatMul) -> Option<Arc<QTensor>> {
+            match qmm {
+                QMatMul::QTensor(t) => Some(t.clone()),
+                _ => None,
+            }
+        }
+        let mut m = HashMap::new();
+        if let Some(t) = inner(&self.output) {
+            m.insert("output.weight".to_string(), t);
+        }
+        for (i, l) in self.layers.iter().enumerate() {
+            let p = format!("blk.{i}");
+            for (name, qmm) in [
+                (format!("{p}.attn_q.weight"), &l.attention_wq),
+                (format!("{p}.attn_k.weight"), &l.attention_wk),
+                (format!("{p}.attn_v.weight"), &l.attention_wv),
+                (format!("{p}.attn_output.weight"), &l.attention_wo),
+                (format!("{p}.ffn_gate.weight"), &l.mlp.feed_forward_w1),
+                (format!("{p}.ffn_down.weight"), &l.mlp.feed_forward_w2),
+                (format!("{p}.ffn_up.weight"), &l.mlp.feed_forward_w3),
+            ] {
+                if let Some(t) = inner(qmm) {
+                    m.insert(name, t);
+                }
+            }
+        }
+        m
     }
 
     fn mask(&mut self, t: usize, device_idx: usize) -> Result<Tensor> {

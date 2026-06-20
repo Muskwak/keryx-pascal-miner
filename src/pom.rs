@@ -13,6 +13,10 @@
 use borsh::{BorshDeserialize, BorshSerialize};
 use candle_core::quantized::gguf_file;
 use candle_core::Device;
+use std::fs::{File, OpenOptions};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::FileExt;
+use std::path::PathBuf;
 use std::sync::OnceLock;
 
 pub const CHUNK_WORDS: usize = 4; // 32 B chunk
@@ -372,55 +376,62 @@ pub fn verify_proof(pre_pow_hash: &[u8; 32], nonce: u64, seed: u64, proof: &PomP
 pub struct WeightIndex {
     pub n_chunks: u64,
     pub r_t: [u8; 32],
-    /// Full Merkle tree, level 0 = leaves up to the single-node root level. Stored so each
-    /// `merkle_path` is O(log N) instead of rebuilding the tree per call (proofs are built at
-    /// block frequency — rebuilding ~N hashes per path would be unusable).
-    tree: Vec<Vec<[u8; 32]>>,
+    /// Raw 32 B chunks (canonical order) kept in RAM for `read_chunk`.
     data: Vec<u8>,
+    /// Disk-backed Merkle tree: all levels (level 0 = leaves … single-node root) concatenated in
+    /// one file, so the 70B tree (~84 GB) need not fit in RAM. `merkle_path` reads ~log N sibling
+    /// nodes via `pread`. Built once per PoM activation; deleted on drop.
+    tree_file: File,
+    tree_path: PathBuf,
+    /// Per level: (byte offset of the level in `tree_file`, node count).
+    level_offsets: Vec<(u64, u64)>,
+}
+
+impl Drop for WeightIndex {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.tree_path);
+    }
 }
 
 impl WeightIndex {
-    /// Build from a GGUF on disk (CPU dtoh of each tensor). The bytes are candle's exact
-    /// quantized bytes — the same the miner serves in VRAM and the builder pinned in `R_T`.
+    /// Build from a GGUF on disk (CPU dtoh of each tensor). The bytes are candle's exact quantized
+    /// bytes — the same the miner serves in VRAM and the builder pinned in `R_T`. The Merkle tree
+    /// is streamed to a temp file next to the GGUF (disk, never tmpfs) so big tiers don't OOM.
     pub fn build_from_gguf(path: &str) -> candle_core::Result<Self> {
         let device = Device::Cpu;
-        let mut file = std::fs::File::open(path).map_err(candle_core::Error::wrap)?;
+        let mut file = File::open(path).map_err(candle_core::Error::wrap)?;
         let content = gguf_file::Content::read(&mut file)?;
         let mut names: Vec<String> = content.tensor_infos.keys().cloned().collect();
         names.sort(); // canonical order
 
-        let mut leaves: Vec<[u8; 32]> = Vec::new();
+        // Tree temp file next to the GGUF (disk-backed; /tmp may be tmpfs = RAM).
+        let dir = std::path::Path::new(path).parent().unwrap_or_else(|| std::path::Path::new("."));
+        let tree_path = dir.join(format!("pom-tree-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&tree_path); // clear a stale file from a crashed run
+        let mut writer = BufWriter::new(
+            OpenOptions::new().read(true).write(true).create(true).truncate(true)
+                .open(&tree_path).map_err(candle_core::Error::wrap)?,
+        );
+
+        // Level 0: hash chunks → leaves (to disk), keep raw chunks in RAM for read_chunk.
         let mut data: Vec<u8> = Vec::new();
+        let mut n_chunks: u64 = 0;
         for name in &names {
             let qt = content.tensor(&mut file, name, &device)?;
             let bytes = qt.data()?;
             let full = bytes.len() / 32;
             for c in 0..full {
                 let chunk = &bytes[c * 32..c * 32 + 32];
-                leaves.push(blake(chunk));
+                writer.write_all(&blake(chunk)).map_err(candle_core::Error::wrap)?;
                 data.extend_from_slice(chunk);
+                n_chunks += 1;
             }
         }
-        if leaves.is_empty() {
+        if n_chunks == 0 {
             return Err(candle_core::Error::Msg("PoM: model produced 0 chunks".into()));
         }
-        let n_chunks = leaves.len() as u64;
 
-        // Build all tree levels once (duplicate-last on odd levels — matches merkle_root).
-        let mut tree: Vec<Vec<[u8; 32]>> = vec![leaves];
-        while tree.last().unwrap().len() > 1 {
-            let level = tree.last().unwrap();
-            let mut next = Vec::with_capacity(level.len().div_ceil(2));
-            let mut i = 0;
-            while i < level.len() {
-                let r = if i + 1 < level.len() { level[i + 1] } else { level[i] };
-                next.push(hash_pair(&level[i], &r));
-                i += 2;
-            }
-            tree.push(next);
-        }
-        let r_t = tree.last().unwrap()[0];
-        Ok(Self { n_chunks, r_t, tree, data })
+        finalize_disk_tree(writer, tree_path, n_chunks, data)
     }
 
     /// 32 B chunk at canonical index `off` (panics if out of range — `off < n_chunks`).
@@ -431,18 +442,68 @@ impl WeightIndex {
         chunk_to_words(&arr)
     }
 
-    /// Inclusion path for chunk index `off` from the prebuilt tree — O(log N).
+    /// Inclusion path for chunk index `off`, reading each sibling from the on-disk tree (pread).
+    /// Byte-identical to the in-RAM duplicate-last walk: an out-of-range sibling is the node itself.
     pub fn merkle_path(&self, off: u64) -> Vec<[u8; 32]> {
-        let mut path = Vec::with_capacity(self.tree.len());
-        let mut idx = off as usize;
-        for level in &self.tree[..self.tree.len() - 1] {
+        let mut path = Vec::with_capacity(self.level_offsets.len());
+        let mut idx = off;
+        for &(loff, count) in &self.level_offsets[..self.level_offsets.len() - 1] {
             let sib_idx = if idx & 1 == 0 { idx + 1 } else { idx - 1 };
-            let sib = if sib_idx < level.len() { level[sib_idx] } else { level[idx] };
-            path.push(sib);
+            let read_idx = if sib_idx < count { sib_idx } else { idx };
+            let mut node = [0u8; 32];
+            self.tree_file
+                .read_exact_at(&mut node, loff + read_idx * 32)
+                .expect("PoM tree read");
+            path.push(node);
             idx >>= 1;
         }
         path
     }
+}
+
+/// Reduce a tree whose level 0 (leaves) is already written to `writer`, streaming each higher level
+/// to the same file (duplicate-last on odd levels), and assemble the `WeightIndex`. Shared by
+/// `build_from_gguf` and tests so the disk reduction is exercised by the synthetic merkle_path tests.
+fn finalize_disk_tree(
+    mut writer: BufWriter<File>,
+    tree_path: PathBuf,
+    n_chunks: u64,
+    data: Vec<u8>,
+) -> candle_core::Result<WeightIndex> {
+    let mut level_offsets: Vec<(u64, u64)> = vec![(0, n_chunks)];
+    loop {
+        let (loff, count) = *level_offsets.last().unwrap();
+        if count == 1 {
+            break;
+        }
+        writer.flush().map_err(candle_core::Error::wrap)?;
+        let next_off = loff + count * 32;
+        let mut reader = BufReader::new(File::open(&tree_path).map_err(candle_core::Error::wrap)?);
+        reader.seek(SeekFrom::Start(loff)).map_err(candle_core::Error::wrap)?;
+        let mut next_count: u64 = 0;
+        let (mut left, mut right) = ([0u8; 32], [0u8; 32]);
+        let mut i: u64 = 0;
+        while i < count {
+            reader.read_exact(&mut left).map_err(candle_core::Error::wrap)?;
+            if i + 1 < count {
+                reader.read_exact(&mut right).map_err(candle_core::Error::wrap)?;
+            } else {
+                right = left; // duplicate-last
+            }
+            writer.write_all(&hash_pair(&left, &right)).map_err(candle_core::Error::wrap)?;
+            next_count += 1;
+            i += 2;
+        }
+        level_offsets.push((next_off, next_count));
+    }
+    writer.flush().map_err(candle_core::Error::wrap)?;
+    let tree_file = writer.into_inner().map_err(|e| candle_core::Error::Msg(format!("PoM tree flush: {e}")))?;
+
+    let (root_off, _) = *level_offsets.last().unwrap();
+    let mut r_t = [0u8; 32];
+    tree_file.read_exact_at(&mut r_t, root_off).map_err(candle_core::Error::wrap)?;
+
+    Ok(WeightIndex { n_chunks, r_t, data, tree_file, tree_path, level_offsets })
 }
 
 /// PoM possession activation DAA score — MUST match the node's `pom_activation`.
@@ -480,27 +541,22 @@ mod tests {
 
     // Synthetic WeightIndex (no GGUF) — exercises the real read_chunk + O(log N) merkle_path.
     fn synth_index(n: u64) -> WeightIndex {
-        let mut leaves = Vec::new();
+        use std::sync::atomic::{AtomicU64, Ordering as O};
+        static UNIQ: AtomicU64 = AtomicU64::new(0);
+        let uid = UNIQ.fetch_add(1, O::Relaxed);
+        let tree_path = std::env::temp_dir().join(format!("keryx-pom-synth-{}-{}.bin", std::process::id(), uid));
+        let _ = std::fs::remove_file(&tree_path);
+        let mut writer = BufWriter::new(
+            OpenOptions::new().read(true).write(true).create(true).truncate(true)
+                .open(&tree_path).unwrap(),
+        );
         let mut data = Vec::new();
         for o in 0..n {
             let b = words_to_bytes(&synth_chunk(o));
-            leaves.push(blake(&b));
+            writer.write_all(&blake(&b)).unwrap();
             data.extend_from_slice(&b);
         }
-        let mut tree = vec![leaves];
-        while tree.last().unwrap().len() > 1 {
-            let level = tree.last().unwrap();
-            let mut next = Vec::with_capacity(level.len().div_ceil(2));
-            let mut i = 0;
-            while i < level.len() {
-                let r = if i + 1 < level.len() { level[i + 1] } else { level[i] };
-                next.push(hash_pair(&level[i], &r));
-                i += 2;
-            }
-            tree.push(next);
-        }
-        let r_t = tree.last().unwrap()[0];
-        WeightIndex { n_chunks: n, r_t, tree, data }
+        finalize_disk_tree(writer, tree_path, n, data).unwrap()
     }
 
     #[test]

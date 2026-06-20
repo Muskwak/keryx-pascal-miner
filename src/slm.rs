@@ -529,6 +529,14 @@ fn load_engine(spec: &'static ModelSpec, device: Device) -> Result<SlmEngine> {
                         .map_err(|e| anyhow!("load gguf weights: {}", e))?;
                     ModelInner::Quantized(model)
                 }
+            } else if pom_force_split() && device.is_cuda() {
+                log::info!(
+                    "SlmEngine: PoM zero-dup — loading '{}' (LLaMA) via single-device split loader",
+                    spec.name
+                );
+                let model = SplitWeights::from_gguf(content, &mut gguf_file, &[device.clone()])
+                    .map_err(|e| anyhow!("load gguf weights (pom split): {}", e))?;
+                ModelInner::QuantizedSplit(model)
             } else {
                 if vram_pool_enabled() && device.is_cuda() {
                     log::info!(
@@ -1261,6 +1269,7 @@ pub fn pom_shared(
     }
     match &e.inner {
         ModelInner::QuantizedQwen3Split(m) => Some((e.device.clone(), m.pom_quant_tensors())),
+        ModelInner::QuantizedSplit(m) => Some((e.device.clone(), m.pom_quant_tensors())),
         _ => None,
     }
 }
