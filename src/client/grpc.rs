@@ -561,8 +561,13 @@ impl KeryxdHandler {
                     keryx_miner::slm::advance_lineup_if_due(daa);
                 }
                 // Handle node-issued inference challenge: spawn an inference task if a new
-                // challenge arrived and no challenge is already in flight.
-                if !template.inference_challenge.is_empty() && self.challenge_inference_rx.is_none() {
+                // challenge arrived and no challenge is already in flight. Ignored under PoM — the
+                // per-block possession proof is the capability gate, so no synthetic challenge
+                // (defensive: holds even against a node that still issues them post-hardfork).
+                if !template.inference_challenge.is_empty()
+                    && self.challenge_inference_rx.is_none()
+                    && self.last_known_daa < keryx_miner::pom::POM_ACTIVATION_DAA
+                {
                     let challenge = template.inference_challenge.clone();
                     let mut parts = challenge.splitn(2, ':');
                     let model_id_hex = parts.next().unwrap_or("").to_string();

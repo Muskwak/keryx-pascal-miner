@@ -500,7 +500,9 @@ impl MinerManager {
             let now = ticker.tick().await;
             let duration = (now - last_instant).as_secs_f64();
             last_instant = now;
-            let challenge_active = opoi_challenge_active.load(Ordering::Relaxed);
+            // PoM model (re)load also intentionally pauses PoW — treat it like an inference pause.
+            let challenge_active = opoi_challenge_active.load(Ordering::Relaxed)
+                || keryx_miner::pom_gpu::is_loading();
             let total = hashes_tried.swap(0, Ordering::AcqRel);
 
             if total > 0 {

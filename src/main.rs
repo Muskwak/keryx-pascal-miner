@@ -471,13 +471,10 @@ async fn main() -> Result<(), Error> {
     // hot-swaps without a restart:
     //   - legacy (daa < H) is prefetched now and mined immediately;
     //   - uncensored (daa >= H) is prefetched in the background and swapped in at H.
-    // LOCAL TESTNET BUILD ONLY — do NOT ship/commit. The chain is already past
-    // OPOI_V2_ACTIVATION_DAA, so the legacy (V1) lineup would be downloaded but never
-    // used. Point the "current" lineup at V2 too so only the 4 uncensored models are
-    // fetched (saves SSD space). Revert this `OPOI_V2_ACTIVATION_DAA` back to `0` for
-    // any real release.
+    // `specs_v1` is the CURRENT (legacy, daa < H) lineup the miner announces and serves until the
+    // chain crosses H — `specs_for(0, ..)` so a fresh chain declares the legacy models.
     let specs_v1 = filter_specs_by_vram(
-        keryx_miner::models::specs_for(keryx_miner::models::OPOI_V2_ACTIVATION_DAA, tier),
+        keryx_miner::models::specs_for(0, tier),
         opt.vram_pool,
         opt.cpu_inference,
     );
@@ -540,69 +537,19 @@ async fn main() -> Result<(), Error> {
             return Err(e.into());
         }
     }
-    // PoM: build the possession weight index for the mining tier, once, after the GGUF is
-    // present (prefetch above). Only when PoM is configured (gated above).
+    // PoM possession setup is fully LAZY: nothing GPU- or host-heavy happens at boot. During the
+    // pre-PoM legacy phase the GPU + host stay free for the legacy lineup (mining + inference start
+    // immediately). The possession index AND the GPU walk are built by the mining loop the first
+    // time PoM is active (DAA >= POM_ACTIVATION_DAA). Here we only record cheap config.
     if let Some(spec) = pom_spec {
         let tier = keryx_miner::models::pom_tier_index(&spec.model_id).expect("pom_spec has a tier");
-        let path = keryx_miner::slm::gguf_path_for(spec).to_string_lossy().into_owned();
-        info!("PoM: building possession index for tier {} ({}) — this can take a while…", tier, spec.dir_name);
-        let expected_n: u64;
-        match tokio::task::spawn_blocking(move || keryx_miner::pom::WeightIndex::build_from_gguf(&path)).await {
-            Ok(Ok(idx)) => {
-                info!("PoM: weight index ready — N={} chunks, R_T[..4]={:02x?}", idx.n_chunks, &idx.r_t[..4]);
-                expected_n = idx.n_chunks;
-                keryx_miner::pom::set_index(idx, tier);
-            }
-            Ok(Err(e)) => {
-                error!("PoM: weight index build failed — cannot mine with possession: {}", e);
-                return Err(e.into());
-            }
-            Err(e) => {
-                error!("PoM: weight index build task panicked: {}", e);
-                return Err(e.into());
-            }
-        }
-        // Load the GPU miner. Option C2 zero-dup: make the inference engine load this tier
-        // resident (via the single-device split loader so it exposes its quant tensors), then
-        // have the possession walk share those VRAM buffers instead of a second copy. Falls back
-        // to a standalone load when the tier can't be shared (non-qwen3, CPU inference, etc.).
         let gpath = keryx_miner::slm::gguf_path_for(spec).to_string_lossy().into_owned();
-        let mining_id = spec.model_id;
-        match tokio::task::spawn_blocking(move || {
-            keryx_miner::slm::set_pom_force_split(true);
-            // Record the tier so the walk can be rebuilt after an inference swaps the model away.
-            keryx_miner::pom_gpu::set_mining_tier(mining_id, gpath.clone());
-            let _ = keryx_miner::slm::ensure_loaded(&mining_id);
-            if let Some((device, shared)) = keryx_miner::slm::pom_shared(&mining_id) {
-                log::info!("PoM: zero-dup — sharing {} resident inference tensors for the walk", shared.len());
-                keryx_miner::pom_gpu::PomGpuMiner::load_shared(&gpath, &device, &shared)
-            } else {
-                log::info!("PoM: tier not shareable — loading a standalone possession copy");
-                keryx_miner::pom_gpu::PomGpuMiner::load(&gpath)
-            }
-        })
-        .await
-        {
-            Ok(Ok(gm)) => {
-                if gm.n_chunks() != expected_n {
-                    error!(
-                        "PoM: gather N={} != index N={} — shared/raw layout mismatch; refusing to mine (would produce rejected blocks)",
-                        gm.n_chunks(), expected_n
-                    );
-                    return Err(format!("PoM gather N mismatch: {} != {}", gm.n_chunks(), expected_n).into());
-                }
-                info!("PoM: GPU miner ready — N={} chunks resident (matches index)", gm.n_chunks());
-                keryx_miner::pom_gpu::install(gm);
-            }
-            Ok(Err(e)) => {
-                error!("PoM: GPU miner load failed — cannot mine with possession: {}", e);
-                return Err(e.into());
-            }
-            Err(e) => {
-                error!("PoM: GPU miner load task panicked: {}", e);
-                return Err(e.into());
-            }
-        }
+        // Force the single-device split loader so the mining tier exposes its quant tensors for
+        // zero-dup sharing, and record the tier so the walk can be built on demand.
+        keryx_miner::slm::set_pom_force_split(true);
+        keryx_miner::pom_gpu::set_mining_tier(spec.model_id, gpath);
+        info!("PoM: configured for tier {} ({}); index + GPU walk load lazily when PoM activates (DAA {}).",
+            tier, spec.dir_name, keryx_miner::pom::POM_ACTIVATION_DAA);
     }
 
     // Verify GPU inference works before mining. OPoI challenges are mandatory, so a miner

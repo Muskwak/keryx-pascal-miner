@@ -199,6 +199,15 @@ pub fn is_installed() -> bool {
     MINER.lock().map(|g| g.is_some()).unwrap_or(false)
 }
 
+/// True while the GPU miner is being (re)built — a heavy one-time model load that blocks the
+/// mining worker. The PoW stall watchdog treats this like an inference pause, not a crash.
+static LOADING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether a PoM model load/rebuild is in progress (worker intentionally paused, not stalled).
+pub fn is_loading() -> bool {
+    LOADING.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Convenience: search a nonce batch via the installed miner. None if not installed or no winner.
 pub fn mine(pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64) -> Option<u64> {
     let g = MINER.lock().ok()?;
@@ -221,10 +230,37 @@ pub fn ensure_installed() -> bool {
     if is_installed() {
         return true;
     }
+    // Flag the heavy load so the stall watchdog stays benign while the worker is blocked here.
+    LOADING.store(true, std::sync::atomic::Ordering::Relaxed);
+    let ok = ensure_installed_inner();
+    LOADING.store(false, std::sync::atomic::Ordering::Relaxed);
+    ok
+}
+
+fn ensure_installed_inner() -> bool {
     let (model_id, gguf) = match MINING_TIER.get() {
         Some(x) => x,
         None => return false,
     };
+    // Build the possession index once (host, heavy) the first time PoM activates — deferred from
+    // boot so the pre-PoM legacy phase starts immediately and keeps host/GPU free.
+    if crate::pom::active_index().is_none() {
+        let tier = match crate::models::pom_tier_index(model_id) {
+            Some(t) => t,
+            None => return false,
+        };
+        info!("PoM: building possession index (first PoM activation) — this can take a while…");
+        match crate::pom::WeightIndex::build_from_gguf(gguf) {
+            Ok(idx) => {
+                info!("PoM: weight index ready — N={} chunks", idx.n_chunks);
+                crate::pom::set_index(idx, tier);
+            }
+            Err(e) => {
+                log::error!("PoM: index build failed: {}", e);
+                return false;
+            }
+        }
+    }
     // Make the mining model resident again (evicts whatever inference loaded), then share it.
     if !crate::slm::ensure_loaded(model_id) {
         return false;
@@ -237,8 +273,15 @@ pub fn ensure_installed() -> bool {
     match m {
         Ok(gm) => {
             let n = gm.n_chunks();
+            // N-guard: the gather must match the host index, else blocks would be rejected.
+            if let Some((idx, _)) = crate::pom::active_index() {
+                if n != idx.n_chunks {
+                    log::error!("PoM: gather N={} != index N={} — refusing to mine (rejected blocks)", n, idx.n_chunks);
+                    return false;
+                }
+            }
             install(gm);
-            info!("PoM: GPU miner rebuilt after inference — N={} chunks resident", n);
+            info!("PoM: GPU miner ready — N={} chunks resident (matches index)", n);
             true
         }
         Err(e) => {
