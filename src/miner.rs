@@ -254,6 +254,12 @@ impl MinerManager {
                 let mut nonces = vec![0u64; 1];
 
                 let mut state = None;
+                // PoM mining: nonce cursor + per-launch batch. The kernel grinds the whole batch
+                // before returning, so BPS_max = hashrate / POM_BATCH. At 1<<22 this capped a
+                // ~24 MH/s GPU at ~5.8 BPS. 1<<20 lifts the ceiling to ~23 BPS while staying well
+                // above kernel-launch overhead (batch ≈ 43 ms at 24 MH/s).
+                let mut pom_nonce: u64 = thread_rng().next_u64();
+                const POM_BATCH: u64 = 1 << 20;
 
                 loop {
                     nonces[0] = 0;
@@ -270,6 +276,44 @@ impl MinerManager {
                             }
                         };
                     }
+                    // PoM possession mining (design A): when active, the walk runs on the GPU
+                    // over the resident weights instead of kHeavyHash. On a winning nonce we build
+                    // the proof (host) and submit; the legacy plugin path below is skipped.
+                    if matches!(state.as_ref(), Some(s) if s.daa_score >= keryx_miner::pom::POM_ACTIVATION_DAA) {
+                        let (pph, time, target_le) = {
+                            let s = state.as_ref().unwrap();
+                            let mut pph = [0u8; 32];
+                            pph.copy_from_slice(&s.pow_hash_header[0..32]);
+                            let time = u64::from_le_bytes(s.pow_hash_header[32..40].try_into().unwrap());
+                            (pph, time, s.target.to_le_bytes())
+                        };
+                        let found = keryx_miner::pom_gpu::mine(&pph, time, &target_le, pom_nonce, POM_BATCH);
+                        pom_nonce = pom_nonce.wrapping_add(POM_BATCH);
+                        hashes_tried.fetch_add(POM_BATCH, Ordering::AcqRel);
+                        worker_hashes_tried.fetch_add(POM_BATCH, Ordering::AcqRel);
+                        if let Some(nonce) = found {
+                            let built = state.as_ref().and_then(|s| {
+                                keryx_miner::pom::active_index().and_then(|(idx, tier)| s.generate_block_if_pom(nonce, idx, *tier))
+                            });
+                            if let Some(block_seed) = built {
+                                match send_channel.blocking_send(block_seed.clone()) {
+                                    Ok(()) => block_seed.report_block(),
+                                    Err(e) => error!("Failed submitting PoM block: ({})", e.to_string()),
+                                }
+                                if let BlockSeed::FullBlock(_) = block_seed {
+                                    state = None;
+                                }
+                            }
+                        } else if let Some(cmd) = block_channel.get_changed()? {
+                            state = match cmd {
+                                Some(WorkerCommand::Job(ns)) => Some(ns),
+                                Some(WorkerCommand::Close) => return Ok(()),
+                                None => state,
+                            };
+                        }
+                        continue;
+                    }
+
                     let state_ref = match &state {
                         Some(s) => {
                             s.load_to_gpu(gpu_work);

@@ -9,7 +9,7 @@
 //! The kernel's seed/pow folds are byte-identical to `pom::pom_block_seed`/`pom::pom_pow_value`,
 //! so a nonce found here builds a `PomProof` (host) the node accepts.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use candle_core::cuda_backend::cudarc::driver::{CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
 use candle_core::quantized::{gguf_file, QTensor};
@@ -70,8 +70,8 @@ impl PomGpuMiner {
             return Err(candle_core::Error::Msg("PoM GPU: model produced 0 chunks".into()));
         }
 
-        let bases_dev = stream.memcpy_stod(&bases).map_err(candle_core::Error::wrap)?;
-        let prefix_dev = stream.memcpy_stod(&prefix).map_err(candle_core::Error::wrap)?;
+        let bases_dev = stream.clone_htod(&bases).map_err(candle_core::Error::wrap)?;
+        let prefix_dev = stream.clone_htod(&prefix).map_err(candle_core::Error::wrap)?;
         // Warm the module cache so mine() never compiles on the hot path.
         let _ = cuda.get_or_load_custom_func("pom_mine", "pom_mine_mod", PTX)?;
 
@@ -88,7 +88,7 @@ impl PomGpuMiner {
         let p = words4(pre_pow_hash);
         let t = words4(target_le);
         let k = crate::pom::POM_WALK_STEPS;
-        let winner = self.stream.memcpy_stod(&[u64::MAX]).map_err(candle_core::Error::wrap)?;
+        let winner = self.stream.clone_htod(&[u64::MAX]).map_err(candle_core::Error::wrap)?;
         let grid = ((batch + 255) / 256) as u32;
         let cfg = LaunchConfig { grid_dim: (grid, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
 
@@ -101,7 +101,22 @@ impl PomGpuMiner {
         unsafe { b.launch(cfg).map_err(candle_core::Error::wrap)?; }
         self.stream.synchronize().map_err(candle_core::Error::wrap)?;
 
-        let w = self.stream.memcpy_dtov(&winner).map_err(candle_core::Error::wrap)?[0];
+        let w = self.stream.clone_dtoh(&winner).map_err(candle_core::Error::wrap)?[0];
         Ok(if w == u64::MAX { None } else { Some(w) })
     }
+}
+
+// The single GPU miner instance, installed once at startup when PoM is configured.
+static MINER: OnceLock<Mutex<PomGpuMiner>> = OnceLock::new();
+
+/// Install the GPU miner (call once at startup, after loading the mining model).
+pub fn install(m: PomGpuMiner) {
+    let _ = MINER.set(Mutex::new(m));
+}
+
+/// Convenience: search a nonce batch via the installed miner. None if not installed or no winner.
+pub fn mine(pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64) -> Option<u64> {
+    let m = MINER.get()?;
+    let g = m.lock().ok()?;
+    g.mine(pre_pow_hash, timestamp, target_le, start, batch).ok().flatten()
 }

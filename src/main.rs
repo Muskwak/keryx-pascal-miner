@@ -560,6 +560,22 @@ async fn main() -> Result<(), Error> {
                 return Err(e.into());
             }
         }
+        // Load the GPU miner: the same model resident in VRAM for the possession walk.
+        let gpath = keryx_miner::slm::gguf_path_for(spec).to_string_lossy().into_owned();
+        match tokio::task::spawn_blocking(move || keryx_miner::pom_gpu::PomGpuMiner::load(&gpath)).await {
+            Ok(Ok(gm)) => {
+                info!("PoM: GPU miner ready — N={} chunks resident", gm.n_chunks());
+                keryx_miner::pom_gpu::install(gm);
+            }
+            Ok(Err(e)) => {
+                error!("PoM: GPU miner load failed — cannot mine with possession: {}", e);
+                return Err(e.into());
+            }
+            Err(e) => {
+                error!("PoM: GPU miner load task panicked: {}", e);
+                return Err(e.into());
+            }
+        }
     }
 
     // Verify GPU inference works before mining. OPoI challenges are mandatory, so a miner
