@@ -15,8 +15,28 @@ use candle_core::quantized::gguf_file;
 use candle_core::Device;
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
+
+fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    #[cfg(target_family = "unix")]
+    {
+        use std::os::unix::fs::FileExt;
+        return file.read_exact_at(buf, offset);
+    }
+    #[cfg(target_family = "windows")]
+    {
+        use std::os::windows::fs::FileExt;
+        let mut pos = 0usize;
+        while pos < buf.len() {
+            let n = file.seek_read(&mut buf[pos..], offset + pos as u64)?;
+            if n == 0 {
+                return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "read_exact_at: eof"));
+            }
+            pos += n;
+        }
+        return Ok(());
+    }
+}
 use std::sync::OnceLock;
 
 pub const CHUNK_WORDS: usize = 4; // 32 B chunk
@@ -467,7 +487,7 @@ impl WeightIndex {
                 // Tensor whose canonical range contains `off`: last entry with start <= off.
                 let j = table.partition_point(|&(start, _)| start <= off) - 1;
                 let (start, file_off) = table[j];
-                file.read_exact_at(&mut arr, file_off + (off - start) * 32).expect("PoM gguf chunk read");
+                read_exact_at(file, &mut arr, file_off + (off - start) * 32).expect("PoM gguf chunk read");
             }
         }
         chunk_to_words(&arr)
@@ -482,8 +502,7 @@ impl WeightIndex {
             let sib_idx = if idx & 1 == 0 { idx + 1 } else { idx - 1 };
             let read_idx = if sib_idx < count { sib_idx } else { idx };
             let mut node = [0u8; 32];
-            self.tree_file
-                .read_exact_at(&mut node, loff + read_idx * 32)
+            read_exact_at(&self.tree_file, &mut node, loff + read_idx * 32)
                 .expect("PoM tree read");
             path.push(node);
             idx >>= 1;
@@ -532,7 +551,7 @@ fn finalize_disk_tree(
 
     let (root_off, _) = *level_offsets.last().unwrap();
     let mut r_t = [0u8; 32];
-    tree_file.read_exact_at(&mut r_t, root_off).map_err(candle_core::Error::wrap)?;
+    read_exact_at(&tree_file, &mut r_t, root_off).map_err(candle_core::Error::wrap)?;
 
     Ok(WeightIndex { n_chunks, r_t, chunks, tree_file, tree_path, level_offsets })
 }
