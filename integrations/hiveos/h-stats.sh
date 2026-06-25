@@ -1,16 +1,22 @@
 #!/usr/bin/env bash
 
-. /hive/miners/custom/keryx-miner/h-manifest.conf
+# Self-locate the manifest from THIS script's own directory (works under a versioned folder, no
+# symlink). No cd / no exit: HiveOS SOURCES this file and reads $khs / $stats from it afterwards,
+# so changing the caller's cwd or calling exit would break the HiveOS agent.
+__MD="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}")")" && pwd)"
+. "$__MD/h-manifest.conf"
 
-# Log format: "2026-05-09 12:00:00.000+02:00 [INFO ] Current hashrate is 5.23 Ghash/s"
 stats_raw=`cat $CUSTOM_LOG_BASENAME.log | grep "Current hashrate is" | tail -n 1`
 
 maxDelay=120
 time_now=`date +%s`
 
-# Parse timestamp from fields $1 (date) and $2 (time), strip timezone offset for date parsing
-datetime_rep=`echo $stats_raw | awk '{split($2,t,/[+-][0-9]{2}:[0-9]{2}$/); print $1, t[1]}'`
-time_rep=`date -d "$datetime_rep" +%s 2>/dev/null || echo 0`
+# The miner logs with env_logger, whose default line starts "[2026-06-24T19:11:32Z INFO ...]"
+# (ISO-8601 UTC, leading '['). Older builds logged "2026-06-24 19:11:32.000+02:00 [INFO ]".
+# Pull the timestamp anywhere on the line (bracket/position independent) and let GNU date parse it
+# (it understands both the T...Z form and the "date time+offset" form natively).
+ts_field=`echo "$stats_raw" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]+)?(Z|[+-][0-9]{2}:?[0-9]{2})?' | head -1`
+time_rep=`date -d "$ts_field" +%s 2>/dev/null || echo 0`
 diffTime=`echo $((time_now-time_rep)) | tr -d '-'`
 
 if [ "$diffTime" -lt "$maxDelay" ]; then
