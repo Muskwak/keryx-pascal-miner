@@ -157,12 +157,12 @@ impl PomGpuMiner {
         let t = words4(target_le);
         let k = crate::pom::POM_WALK_STEPS;
         let winner = self.stream.clone_htod(&[u64::MAX]).map_err(candle_core::Error::wrap)?;
-        let grid = ((batch + 255) / 256) as u32;
+        let grid = ((batch + 127) / 128) as u32;
         // The P40 kernel cooperatively loads prefix[0..T] into dynamic shared memory (smem
         // latency ~20 cyc beats ~400-cyc global for the per-step binary search). Size = the
         // (T+1) offset entries × 8 bytes. Falls back to 0 for the plain kernel if T is 0.
         let smem_bytes = ((self.t_count as usize + 1) * std::mem::size_of::<u64>()) as u32;
-        let cfg = LaunchConfig { grid_dim: (grid, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: smem_bytes };
+        let cfg = LaunchConfig { grid_dim: (grid, 1, 1), block_dim: (128, 1, 1), shared_mem_bytes: smem_bytes };
 
         let func = self.cuda.get_or_load_custom_func("pom_mine", "pom_mine_mod", PTX)?; // cached
         let mut b = func.builder();

@@ -259,7 +259,7 @@ impl MinerManager {
                 // ~24 MH/s GPU at ~5.8 BPS. 1<<20 lifts the ceiling to ~23 BPS while staying well
                 // above kernel-launch overhead (batch ≈ 43 ms at 24 MH/s).
                 let mut pom_nonce: u64 = thread_rng().next_u64();
-                const POM_BATCH: u64 = 1 << 20;
+                const POM_BATCH: u64 = 1 << 21;
 
                 loop {
                     nonces[0] = 0;
