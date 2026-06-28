@@ -2,7 +2,20 @@
 
 A high-performance miner for **Keryx**, combining GPU PoW (kHeavyHash) with on-chain AI inference (OPoI — Optimistic Proof of Inference).
 
-This fork adds Pascal-architecture (sm_61) tuning: native sm_61 CUDA kernels (no Ampere-targeted PTX JIT'd down by the driver), a magic-number-modulo PoM walk kernel, and per-card `SM_ARCH` builds. Tuned and tested on the Tesla P40.
+This fork adds Pascal-architecture (sm_61) tuning and **6 GB VRAM support**:
+
+- **Native sm_61 CUDA kernels** (no Ampere-targeted PTX JIT'd down by the driver on Pascal), a magic-number-modulo PoM walk, and per-card `SM_ARCH` builds — tuned and tested on the Tesla P40.
+- **Vectorized PoM gather** (2 × 128-bit `__ldg` instead of 4 × 64-bit): +20.8% on Pascal (P40). Bit-exact, verified against a CPU reference walk.
+- **Runs on 6 GB cards.** Two upstream bugs starved cards like the RTX 4050 into PCIe paging (~0.4 MH/s): the Gemma-3-4B PoM walk loaded a duplicate ~2 GB weight copy, and candle pre-allocated rotary-embedding tables to the full 128K context (~4.3 GB across 34 layers). Both fixed — see `vendor/candle-transformers/`.
+
+### Measured hashrate
+
+| GPU | VRAM | Tier | Live hashrate |
+|-----|------|------|---------------|
+| RTX 4050 (Laptop) | 6 GB | `--light` | **~7.9 MH/s** |
+| Tesla P40 | 24 GB | `--light` | ~4.8 MH/s (single card) |
+
+4050 numbers are steady-state live miner readings (PoW + OPoI inference active), confirmed after the 6 GB fix recovered the card from ~0.4 MH/s.
 
 ---
 
@@ -24,19 +37,31 @@ This only affects which address block rewards pay; it does not affect hashrate, 
 
 ## Precompiled Binaries
 
-Download the latest release from the [Releases page](https://github.com/Keryx-Labs/keryx-miner/releases).
+Prebuilt **Windows** and **Linux** binaries are on the [Releases page](https://github.com/Muskwak/keryx-pascal-miner/releases) — including a 6 GB-card build that runs Gemma-3-4B on the RTX 4050. Each release ships with the CUDA plugins (`keryxcuda.dll`/`libkeryxcuda.so`) alongside the miner.
 
 ---
 
 ## Build from Source
+
+This fork builds with the **CUDA 12.x toolkit** + **MSVC** (Windows) or **GCC ≤ 12** (Linux). The build picks the CUDA compute capability from the `SM_ARCH` env var (default `61` = Pascal / Tesla P40). Set it to match your target GPU:
+
+| GPU | `SM_ARCH` |
+|-----|-----------|
+| Tesla P40 / GTX 10xx (Pascal) | `61` *(default)* |
+| RTX 20xx (Turing) | `75` |
+| RTX 30xx (Ampere) | `86` |
+| RTX 40xx / RTX 4050 (Ada) | `89` |
+| RTX 50xx (Blackwell) | `89` *(PTX JIT-forwards)* |
+
+The `build.rs` auto-discovers `cl.exe` (Windows) or `gcc` (Linux) — no manual `vcvars` needed. Detailed single-toolkit and container recipes follow.
 
 ### Standard build (PoW only, no inference)
 
 Requires: Rust + Cargo ([rustup.rs](https://rustup.rs/)), `protoc` (`protobuf-compiler`)
 
 ```bash
-git clone https://github.com/Keryx-Labs/keryx-miner.git
-cd keryx-miner
+git clone https://github.com/Muskwak/keryx-pascal-miner.git
+cd keryx-pascal-miner
 cargo build --release --bin keryx-miner
 ```
 
@@ -118,12 +143,10 @@ Binary: `target-cuda/release/keryx-miner`
 
 | Flag | Models supported | Min VRAM |
 |------|-----------------|----------|
-| *(none)* | TinyLlama 1.1B + DeepSeek-R1-8B | 8 GB |
-| `--light` | TinyLlama 1.1B only | 4 GB |
-| `--high` | TinyLlama 1.1B + DeepSeek-R1-8B + DeepSeek-R1-32B | 24 GB |
-| `--very-high` | All 4 models (+ LLaMA-3.3-70B) | 32 GB |
+| `--light` | Gemma-3-4B (baseline tier) | **6 GB** |
+| `--high` | Qwen3-32B-abliterated (Q4_K_M) | 24 GB |
 
-Models are loaded **on demand** when a request arrives and cached between requests. Mining pauses during inference, then resumes automatically.
+`--light` is the tier this fork targets for low-VRAM cards (6 GB → RTX 4050, etc.): it mines **Gemma-3-4B** under PoM and runs ~7.9 MH/s on a 6 GB card after the VRAM fixes. Models are loaded **on demand** when an inference request arrives and cached between requests; mining pauses during inference, then resumes automatically. On the 4050 the zero-dup gather + rotary-table cap keep resident VRAM under ~3 GB (vs ~5.8 GB pre-fix), so PoW and inference coexist without paging.
 
 To run without inference (PoW only):
 
