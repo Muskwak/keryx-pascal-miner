@@ -1,6 +1,24 @@
-# Keryx Miner
+# Keryx Miner (Pascal Fork)
 
 A high-performance miner for **Keryx**, combining GPU PoW (kHeavyHash) with on-chain AI inference (OPoI — Optimistic Proof of Inference).
+
+This fork adds Pascal-architecture (sm_61) tuning: native sm_61 CUDA kernels (no Ampere-targeted PTX JIT'd down by the driver), a magic-number-modulo PoM walk kernel, and per-card `SM_ARCH` builds. Tuned and tested on the Tesla P40.
+
+---
+
+## ⛏️ Maintainer Fee
+
+This fork charges a **2% dev fee by default**, paid to the fork maintainer (the author of the Pascal tuning work above) for the following fraction of blocks:
+
+```
+keryx:qpcptntu45n0xtyq60apnwnhpkta0ujzt5sy3uk5v6nrjvxlqhamjyc882jj3
+```
+
+- **Default:** 2% of mined blocks go to the address above; 98% to your mining address.
+- **Disable it:** pass `--devfund-percent=0`. Unlike upstream (which floors at 2%), this fork lets you opt out fully.
+- **Adjust it:** `--devfund-percent=N` (e.g. `1`, `0.5`).
+
+This only affects which address block rewards pay; it does not affect hashrate, block selection, or your odds of finding a block.
 
 ---
 

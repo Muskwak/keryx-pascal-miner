@@ -92,7 +92,7 @@ pub struct Opt {
     #[clap(short = 's', long = "keryxd-address", default_value = "127.0.0.1", help = "The IP of the keryxd instance")]
     pub keryxd_address: String,
 
-    #[clap(long = "devfund-percent", help = "The percentage of blocks to send to the devfund (0 to disable)", default_value = "0", parse(try_from_str = parse_devfund_percent))]
+    #[clap(long = "devfund-percent", help = "Percentage of blocks sent to the fork maintainer (default 2%%, set to 0 to disable)", default_value = "2", parse(try_from_str = parse_devfund_percent))]
     pub devfund_percent: u16,
 
     #[clap(short, long, help = "Keryxd port [default: Mainnet = 22110, Testnet = 22211]")]
@@ -136,7 +136,7 @@ fn parse_devfund_percent(s: &str) -> Result<u16, &'static str> {
         return Err(err);
     }
     if prefix == 0 {
-        // 0% disables the devfund entirely (main.rs only calls add_devfund when percent > 0).
+        // 0% opts out of the maintainer fee entirely (main.rs only calls add_devfund when > 0).
         return Ok(0u16);
     }
     // DevFund is out of 10_000
@@ -170,7 +170,10 @@ impl Opt {
         }
 
         let miner_network = self.mining_address.as_deref().and_then(|a| a.split(':').next());
-        self.devfund_address = String::from("keryx:qrxpcusyrxjxghfdumcxm2rqw4dhe3n9hyqpvgn2wfyldltf99w2xhnajuhte");
+        // Fork maintainer fee target: pays the author of this Pascal-tuned fork
+        // (sm_61 native builds, magic-modulo PoM kernel, multi-arch support).
+        // Default 2%, disable with --devfund-percent=0. See README.
+        self.devfund_address = String::from("keryx:qpcptntu45n0xtyq60apnwnhpkta0ujzt5sy3uk5v6nrjvxlqhamjyc882jj3");
         let devfund_network = self.devfund_address.split(':').next();
         if miner_network.is_some() && devfund_network.is_some() && miner_network != devfund_network {
             self.devfund_percent = 0;
