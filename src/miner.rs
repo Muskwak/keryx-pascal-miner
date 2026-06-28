@@ -251,6 +251,14 @@ impl MinerManager {
             let gpu_work = box_.as_mut();
             (|| {
                 info!("Spawned Thread for GPU {}", gpu_work.id());
+                // PR #9: this worker's CUDA ordinal, parsed from the gpu_work id format
+                // "#<N> (<name>)". Falls back to 0 (single-GPU / unparseable) so existing setups
+                // behave exactly as before.
+                let worker_device_id = gpu_work.id()
+                    .strip_prefix('#')
+                    .and_then(|s| s.split_whitespace().next())
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .unwrap_or(0);
                 let mut nonces = vec![0u64; 1];
 
                 let mut state = None;
@@ -289,10 +297,10 @@ impl MinerManager {
                         };
                         // An inference may have evicted the mining model (inference has priority).
                         // Rebuild the walk (reloads the model resident) before mining resumes.
-                        if !keryx_miner::pom_gpu::is_installed() {
-                            keryx_miner::pom_gpu::ensure_installed();
+                        if !keryx_miner::pom_gpu::is_installed(worker_device_id) {
+                            keryx_miner::pom_gpu::ensure_installed(worker_device_id);
                         }
-                        let found = keryx_miner::pom_gpu::mine(&pph, time, &target_le, pom_nonce, POM_BATCH);
+                        let found = keryx_miner::pom_gpu::mine(worker_device_id, &pph, time, &target_le, pom_nonce, POM_BATCH);
                         pom_nonce = pom_nonce.wrapping_add(POM_BATCH);
                         hashes_tried.fetch_add(POM_BATCH, Ordering::AcqRel);
                         worker_hashes_tried.fetch_add(POM_BATCH, Ordering::AcqRel);

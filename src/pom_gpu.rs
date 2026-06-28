@@ -9,6 +9,7 @@
 //! The kernel's seed/pow folds are byte-identical to `pom::pom_block_seed`/`pom::pom_pow_value`,
 //! so a nonce found here builds a `PomProof` (host) the node accepts.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use log::info;
@@ -104,7 +105,7 @@ pub struct PomGpuMiner {
     cuda: CudaDevice,
     stream: Arc<CudaStream>,
     bases_dev: CudaSlice<u64>,
-    prefix_dev: CudaSlice<u64>,
+    prefix_dev: CudaSlice<u32>,
     t_count: u32,
     n_total_chunks: u64,
     _tensors: Vec<QTensor>, // raw-loaded tensors kept alive so the gather pointers stay valid
@@ -112,9 +113,10 @@ pub struct PomGpuMiner {
 }
 
 impl PomGpuMiner {
-    /// Load the mining model's GGUF into candle (device 0), build the gather index, load the kernel.
-    pub fn load(gguf_path: &str) -> candle_core::Result<Self> {
-        let device = Device::new_cuda(0)?;
+    /// Load the mining model's GGUF into candle (the given CUDA device ordinal), build the gather
+    /// index, load the kernel. `device_id` is the CUDA ordinal the worker is bound to.
+    pub fn load(gguf_path: &str, device_id: usize) -> candle_core::Result<Self> {
+        let device = Device::new_cuda(device_id)?;
         let cuda = match &device {
             Device::Cuda(c) => c.clone(),
             _ => return Err(candle_core::Error::Msg("PoM GPU: not a CUDA device".into())),
@@ -128,10 +130,10 @@ impl PomGpuMiner {
 
         let mut tensors: Vec<QTensor> = Vec::with_capacity(names.len());
         let mut bases: Vec<u64> = Vec::new();
-        let mut prefix: Vec<u64> = vec![0];
+        let mut prefix: Vec<u32> = vec![0];
         for name in &names {
             let qt = content.tensor(&mut file, name, &device)?;
-            let chunks = (qt.storage_size_in_bytes() / CHUNK_BYTES) as u64;
+            let chunks = (qt.storage_size_in_bytes() / CHUNK_BYTES) as u32;
             if chunks == 0 {
                 tensors.push(qt);
                 continue;
@@ -140,7 +142,7 @@ impl PomGpuMiner {
             prefix.push(prefix.last().unwrap() + chunks);
             tensors.push(qt);
         }
-        let n_total_chunks = *prefix.last().unwrap();
+        let n_total_chunks = *prefix.last().unwrap() as u64;
         if n_total_chunks == 0 {
             return Err(candle_core::Error::Msg("PoM GPU: model produced 0 chunks".into()));
         }
@@ -177,12 +179,12 @@ impl PomGpuMiner {
         let mut raw: Vec<QTensor> = Vec::new();
         let mut kept_shared: Vec<Arc<QTensor>> = Vec::new();
         let mut bases: Vec<u64> = Vec::new();
-        let mut prefix: Vec<u64> = vec![0];
+        let mut prefix: Vec<u32> = vec![0];
         let mut shared_hits = 0usize;
         for name in &names {
             let (ptr, chunks) = if let Some(qt) = shared.get(name) {
                 // Matrix already resident for inference → reuse its buffer (zero dup).
-                let c = (qt.storage_size_in_bytes() / CHUNK_BYTES) as u64;
+                let c = (qt.storage_size_in_bytes() / CHUNK_BYTES) as u32;
                 let p = qt.device_ptr()? as usize as u64;
                 kept_shared.push(qt.clone());
                 shared_hits += 1;
@@ -190,7 +192,7 @@ impl PomGpuMiner {
             } else {
                 // Dequantized-in-inference (token_embd, norms): read the raw quantized bytes.
                 let qt = content.tensor(&mut file, name, device)?;
-                let c = (qt.storage_size_in_bytes() / CHUNK_BYTES) as u64;
+                let c = (qt.storage_size_in_bytes() / CHUNK_BYTES) as u32;
                 if c == 0 {
                     raw.push(qt);
                     continue;
@@ -205,7 +207,7 @@ impl PomGpuMiner {
             bases.push(ptr);
             prefix.push(prefix.last().unwrap() + chunks);
         }
-        let n_total_chunks = *prefix.last().unwrap();
+        let n_total_chunks = *prefix.last().unwrap() as u64;
         if n_total_chunks == 0 {
             return Err(candle_core::Error::Msg("PoM GPU: shared load produced 0 chunks".into()));
         }
@@ -240,9 +242,10 @@ impl PomGpuMiner {
         let winner = self.stream.clone_htod(&[u64::MAX]).map_err(candle_core::Error::wrap)?;
         let grid = ((batch + 127) / 128) as u32;
         // The P40 kernel cooperatively loads prefix[0..T] into dynamic shared memory (smem
-        // latency ~20 cyc beats ~400-cyc global for the per-step binary search). Size = the
-        // (T+1) offset entries × 8 bytes. Falls back to 0 for the plain kernel if T is 0.
-        let smem_bytes = ((self.t_count as usize + 1) * std::mem::size_of::<u64>()) as u32;
+        // latency ~20 cyc beats ~400-cyc global for the per-step binary search). u32 prefix means
+        // half the smem of u64 — 2 KB vs 4 KB for 501 tensors — raising P40 occupancy from 75 %
+        // (48 warps/SM) to 100 % (64 warps/SM), giving the scheduler more warps to hide latency.
+        let smem_bytes = ((self.t_count as usize + 1) * std::mem::size_of::<u32>()) as u32;
         let cfg = LaunchConfig { grid_dim: (grid, 1, 1), block_dim: (128, 1, 1), shared_mem_bytes: smem_bytes };
 
         let func = self.cuda.get_or_load_custom_func("pom_mine", "pom_mine_mod", PTX)?; // cached
@@ -260,29 +263,45 @@ impl PomGpuMiner {
     }
 }
 
-// The GPU miner instance. Option (not OnceLock) so it can be uninstalled to free VRAM when an
-// inference for another model needs the GPU (inference has priority over PoW), then reinstalled
-// when mining resumes.
-static MINER: Mutex<Option<PomGpuMiner>> = Mutex::new(None);
+// The GPU miner instances, one per CUDA device ordinal. A single physical GPU may run multiple
+// mining workers (PR #9: split the card's VRAM into multiple `--light` pools), each bound to the
+// same device_id but driving its own PoM kernel over its own resident weight blob. Each entry can
+// be individually uninstalled to free its VRAM when an inference for another model needs the GPU
+// (inference has priority over PoW), then reinstalled when that worker's mining resumes.
+//
+// `MINERS` holds one entry per device ordinal; `INDEX_BUILD_LOCK` serializes the heavy first-time
+// possession-index build so two workers on the same device don't duplicate the GGUF walk.
+fn miners() -> &'static Mutex<HashMap<u32, Arc<PomGpuMiner>>> {
+    static MINERS: OnceLock<Mutex<HashMap<u32, Arc<PomGpuMiner>>>> = OnceLock::new();
+    MINERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
-/// Install the GPU miner (after loading/sharing the mining model's resident weights).
-pub fn install(m: PomGpuMiner) {
-    if let Ok(mut g) = MINER.lock() {
-        *g = Some(m);
+/// Serialize the heavy one-time possession-index build across workers (esp. on the same GPU).
+fn index_build_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+/// Install the GPU miner for `device_id` (after loading/sharing the mining model's resident
+/// weights). Replaces any prior miner on that device.
+pub fn install(device_id: u32, m: PomGpuMiner) {
+    if let Ok(mut g) = miners().lock() {
+        g.insert(device_id, Arc::new(m));
     }
 }
 
-/// Drop the GPU miner, releasing its hold on the mining model's VRAM (shared Arcs + gather) so
-/// the inference engine can load another model. Mining is paused during inference anyway.
+/// Drop the GPU miners on ALL devices, releasing their hold on the mining model's VRAM (shared
+/// Arcs + gather) so the inference engine can load another model. Mining is paused during
+/// inference anyway. Device-agnostic by design: inference has priority over every worker.
 pub fn uninstall() {
-    if let Ok(mut g) = MINER.lock() {
-        *g = None;
+    if let Ok(mut g) = miners().lock() {
+        g.clear();
     }
 }
 
-/// Whether the GPU miner is currently installed.
-pub fn is_installed() -> bool {
-    MINER.lock().map(|g| g.is_some()).unwrap_or(false)
+/// Whether the GPU miner for `device_id` is currently installed.
+pub fn is_installed(device_id: u32) -> bool {
+    miners().lock().map(|g| g.contains_key(&device_id)).unwrap_or(false)
 }
 
 /// True while the GPU miner is being (re)built — a heavy one-time model load that blocks the
@@ -294,10 +313,12 @@ pub fn is_loading() -> bool {
     LOADING.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Convenience: search a nonce batch via the installed miner. None if not installed or no winner.
-pub fn mine(pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64) -> Option<u64> {
-    let g = MINER.lock().ok()?;
-    g.as_ref()?.mine(pre_pow_hash, timestamp, target_le, start, batch).ok().flatten()
+/// Convenience: search a nonce batch via the installed miner on `device_id`. None if that device
+/// has no installed miner or no winner was found.
+pub fn mine(device_id: u32, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64) -> Option<u64> {
+    let g = miners().lock().ok()?;
+    let m = g.get(&device_id)?;
+    m.mine(pre_pow_hash, timestamp, target_le, start, batch).ok().flatten()
 }
 
 /// Mining-tier identity for rebuilds: (model_id, gguf_path). Set once at startup.
@@ -308,42 +329,46 @@ pub fn set_mining_tier(model_id: [u8; 32], gguf_path: String) {
     let _ = MINING_TIER.set((model_id, gguf_path));
 }
 
-/// Ensure the GPU miner is installed; if an inference evicted the mining model, reload it
-/// (resident again) and rebuild the zero-dup gather. Heavy (model reload) but only when needed —
-/// inference has priority, so mining reloads its model when it next gets the GPU. Returns true if
-/// the miner is ready to mine.
-pub fn ensure_installed() -> bool {
-    if is_installed() {
+/// Ensure the GPU miner for `device_id` is installed; if an inference evicted the mining model,
+/// reload it (resident again) and rebuild the zero-dup gather. Heavy (model reload) but only when
+/// needed — inference has priority, so mining reloads its model when it next gets the GPU. Returns
+/// true if the miner is ready to mine.
+pub fn ensure_installed(device_id: u32) -> bool {
+    if is_installed(device_id) {
         return true;
     }
     // Flag the heavy load so the stall watchdog stays benign while the worker is blocked here.
     LOADING.store(true, std::sync::atomic::Ordering::Relaxed);
-    let ok = ensure_installed_inner();
+    let ok = ensure_installed_inner(device_id);
     LOADING.store(false, std::sync::atomic::Ordering::Relaxed);
     ok
 }
 
-fn ensure_installed_inner() -> bool {
+fn ensure_installed_inner(device_id: u32) -> bool {
     let (model_id, gguf) = match MINING_TIER.get() {
         Some(x) => x,
         None => return false,
     };
     // Build the possession index once (host, heavy) the first time PoM activates — deferred from
-    // boot so the pre-PoM legacy phase starts immediately and keeps host/GPU free.
+    // boot so the pre-PoM legacy phase starts immediately and keeps host/GPU free. Serialized so
+    // multiple workers (esp. on the same GPU) don't duplicate the GGUF walk.
     if crate::pom::active_index().is_none() {
-        let tier = match crate::models::pom_tier_index(model_id) {
-            Some(t) => t,
-            None => return false,
-        };
-        info!("PoM: building possession index (first PoM activation) — this can take a while…");
-        match crate::pom::WeightIndex::build_from_gguf(gguf) {
-            Ok(idx) => {
-                info!("PoM: weight index ready — N={} chunks", idx.n_chunks);
-                crate::pom::set_index(idx, tier);
-            }
-            Err(e) => {
-                log::error!("PoM: index build failed: {}", e);
-                return false;
+        let _lk = index_build_lock().lock().ok();
+        if crate::pom::active_index().is_none() {
+            let tier = match crate::models::pom_tier_index(model_id) {
+                Some(t) => t,
+                None => return false,
+            };
+            info!("PoM: building possession index (first PoM activation) — this can take a while…");
+            match crate::pom::WeightIndex::build_from_gguf(gguf) {
+                Ok(idx) => {
+                    info!("PoM: weight index ready — N={} chunks", idx.n_chunks);
+                    crate::pom::set_index(idx, tier);
+                }
+                Err(e) => {
+                    log::error!("PoM: index build failed: {}", e);
+                    return false;
+                }
             }
         }
     }
@@ -354,7 +379,7 @@ fn ensure_installed_inner() -> bool {
     let m = if let Some((device, shared)) = crate::slm::pom_shared(model_id) {
         PomGpuMiner::load_shared(gguf, &device, &shared)
     } else {
-        PomGpuMiner::load(gguf)
+        PomGpuMiner::load(gguf, device_id as usize)
     };
     match m {
         Ok(gm) => {
@@ -366,8 +391,8 @@ fn ensure_installed_inner() -> bool {
                     return false;
                 }
             }
-            install(gm);
-            info!("PoM: GPU miner ready — N={} chunks resident (matches index)", n);
+            install(device_id, gm);
+            info!("PoM: GPU miner ready on device {} — N={} chunks resident (matches index)", device_id, n);
             true
         }
         Err(e) => {
