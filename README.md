@@ -13,7 +13,7 @@ This fork adds Pascal-architecture (sm_61) tuning and **6 GB VRAM support**:
 | GPU | VRAM | Tier | Live hashrate |
 |-----|------|------|---------------|
 | RTX 4050 (Laptop) | 6 GB | `--light` | **~7.9 MH/s** |
-| Tesla P40 | 24 GB | `--light` | ~4.8 MH/s (single card) |
+| Tesla P40 | 24 GB | `--light` | ~8.0 MH/s (single card) |
 
 4050 numbers are steady-state live miner readings (PoW + OPoI inference active), confirmed after the 6 GB fix recovered the card from ~0.4 MH/s.
 
