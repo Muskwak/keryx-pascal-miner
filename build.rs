@@ -48,9 +48,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=cuda/pom_mine.cu");
     {
         let out_dir = env::var("OUT_DIR").unwrap();
+        // Resolve nvcc explicitly: NVCC env var wins; else CUDA_PATH/bin/nvcc(.exe); else PATH.
+        // This matters when multiple CUDA toolkits coexist (e.g. v11.8 + v12.8) — without it the
+        // bare "nvcc" resolves via PATH and may pick an older toolkit whose headers reject a
+        // newer MSVC (fatal error C1189), producing a confusing build failure. CUDA_PATH is the
+        // standard env var the rest of the CUDA ecosystem honors.
         let nvcc = env::var("NVCC").ok().unwrap_or_else(|| {
-            let pinned = "/home/slash/cuda-12.2/bin/nvcc";
-            if std::path::Path::new(pinned).exists() { pinned.to_string() } else { "nvcc".to_string() }
+            if let Some(base) = env::var_os("CUDA_PATH") {
+                let mut p = std::path::PathBuf::from(base);
+                p.push("bin");
+                p.push(if cfg!(windows) { "nvcc.exe" } else { "nvcc" });
+                if p.exists() { return p.to_string_lossy().into_owned(); }
+            }
+            "nvcc".to_string()
         });
         // Default to sm_61 (Tesla P40 / Pascal GP102) — this fork is the Pascal-tuned miner.
         // Override with SM_ARCH for other cards (e.g. sm_75 for Turing, sm_86 for Ampere).
@@ -61,8 +71,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // build_release.bat's vcvars64; if not (e.g. building from a bare shell), honor an
         // explicit MSVC_CLBIN env var or auto-discover the newest VS 2022 toolchain so the build
         // is robust regardless of how it's launched.
+        // NOTE: -Xptxas=-v (verbose ptxas, for register/occupancy tuning) is intentionally
+        // omitted — it crashes nvcc on deprecated targets (sm_61/75) with CUDA 12.8 + MSVC,
+        // failing the build. The register/occupancy tuning is already done (21 regs, 100%
+        // occupancy on sm_61); re-enable locally with SM_ARCH=89 if you need to re-measure.
         let mut cmd = std::process::Command::new(&nvcc);
-        cmd.args(["-ptx", "-O3", "--use_fast_math", "-Xptxas=-v", "-Xptxas=-O3",
+        cmd.args(["-ptx", "-O3", "--use_fast_math",
                   &format!("-arch=sm_{sm}"), "cuda/pom_mine.cu", "-o", &ptx]);
         if let Ok(c) = env::var("MSVC_CLBIN").or_else(|_| discover_clbin()) {
             println!("cargo:warning=nvcc host compiler: {c}");
@@ -71,8 +85,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // -Xptxas=-v surfaces register usage + occupancy so the threads/block + maxrregcount
         // tuning in pom_gpu.rs can be measured instead of guessed.
-        let status = cmd.status().unwrap_or_else(|e| panic!("nvcc ({nvcc}) failed to run: {e}"));
-        assert!(status.success(), "nvcc failed to compile cuda/pom_mine.cu");
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+        let out = cmd.output().unwrap_or_else(|e| panic!("nvcc ({nvcc}) failed to run: {e}"));
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            panic!("nvcc failed to compile cuda/pom_mine.cu (sm_{sm}):\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}");
+        }
     }
 
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
