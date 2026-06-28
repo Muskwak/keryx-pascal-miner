@@ -34,7 +34,7 @@ pub struct Opt {
 
     #[clap(
         long = "very-high",
-        help = "Model tier: Llama-3.3-70B — 48GB+ single-GPU (RTX 6000 Ada / A6000 / L40S)",
+        help = "Model tier: Llama-3.3-70B — Q4 48GB (RTX 6000 Ada / A6000 / L40S) → Q2_K_L 32GB / RTX 5090 post-H2",
         help_heading = "OPoI / Inference",
         conflicts_with_all = &["very_light", "light", "high"]
     )]

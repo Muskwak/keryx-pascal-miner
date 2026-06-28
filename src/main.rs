@@ -435,11 +435,15 @@ async fn main() -> Result<(), Error> {
         info!("default mode: mines Dolphin-8B under PoM.");
         keryx_miner::models::Tier::Default
     };
-    // Post-OPoI-v2 only: the legacy lineup (daa < H) is dead — the OPoI-v2 hardfork (DAA H) is in
-    // the past, so no fresh miner is ever pre-H again. We stage and download ONLY the uncensored
-    // lineup (`specs_for(>= H, ..)`), filtered by what this hardware can serve (layer-A gate).
+    // Stage the FINAL lineup (post-H2) directly — `specs_for(VERY_LIGHT_ACTIVATION_DAA, ..)` always
+    // returns the latest models for the tier. The legacy lineup is dead (OPoI-v2 is in the past),
+    // and we deliberately do NOT also download the pre-H2 model for a tier whose model changes at
+    // H2: the old `--very-high` 70B Q4_K_M is served by nobody (48 GB-only), so a 5090 miner just
+    // pulls the new Q2_K_L straight away instead of paying two ~27 GB downloads + a hot-swap. A
+    // tier whose post-H2 model isn't consensus-valid yet (very-light, very-high) simply produces no
+    // block until H2 (its `pom_tier_index` is None pre-H2) — it idles, no wasted bandwidth.
     let specs_v2 = filter_specs_by_vram(
-        keryx_miner::models::specs_for(keryx_miner::models::OPOI_V2_ACTIVATION_DAA, tier),
+        keryx_miner::models::specs_for(keryx_miner::models::VERY_LIGHT_ACTIVATION_DAA, tier),
     );
     // PoM: pick the highest tier this miner serves that has a pinned R_T (the model it will
     // mine under possession). Captured before `specs_v2` is consumed; the index is built after
