@@ -304,13 +304,14 @@ pub fn is_installed(device_id: u32) -> bool {
     miners().lock().map(|g| g.contains_key(&device_id)).unwrap_or(false)
 }
 
-/// True while the GPU miner is being (re)built — a heavy one-time model load that blocks the
-/// mining worker. The PoW stall watchdog treats this like an inference pause, not a crash.
-static LOADING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Counts GPU miners being (re)built — each a heavy one-time model load that blocks its worker.
+/// The PoW stall watchdog treats a nonzero count like an inference pause, not a crash. Counter
+/// (not bool) so concurrent loads from multiple workers/devices don't clobber each other.
+static LOADING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// Whether a PoM model load/rebuild is in progress (worker intentionally paused, not stalled).
+/// Whether any PoM model load/rebuild is in progress (a worker is intentionally paused, not stalled).
 pub fn is_loading() -> bool {
-    LOADING.load(std::sync::atomic::Ordering::Relaxed)
+    LOADING.load(std::sync::atomic::Ordering::Relaxed) > 0
 }
 
 /// Convenience: search a nonce batch via the installed miner on `device_id`. None if that device
@@ -332,19 +333,29 @@ pub fn set_mining_tier(model_id: [u8; 32], gguf_path: String) {
 /// Ensure the GPU miner for `device_id` is installed; if an inference evicted the mining model,
 /// reload it (resident again) and rebuild the zero-dup gather. Heavy (model reload) but only when
 /// needed — inference has priority, so mining reloads its model when it next gets the GPU. Returns
-/// true if the miner is ready to mine.
-pub fn ensure_installed(device_id: u32) -> bool {
+/// true if the miner is ready to mine. `daa` is the current block's score — used to compute the
+/// PoM tier index (DAA-gated at the very-light H2 hardfork) when building the possession index.
+pub fn ensure_installed(device_id: u32, daa: u64) -> bool {
     if is_installed(device_id) {
         return true;
     }
     // Flag the heavy load so the stall watchdog stays benign while the worker is blocked here.
-    LOADING.store(true, std::sync::atomic::Ordering::Relaxed);
-    let ok = ensure_installed_inner(device_id);
-    LOADING.store(false, std::sync::atomic::Ordering::Relaxed);
+    // Counter (not bool) so concurrent loads from multiple workers don't clobber each other.
+    LOADING.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let ok = ensure_installed_inner(device_id, daa);
+    LOADING.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     ok
 }
 
-fn ensure_installed_inner(device_id: u32) -> bool {
+/// PoM tier index of the mining model at a given block DAA. Recomputed per block (not frozen at
+/// index-build time) so the tier reindexing at the very-light hardfork (H2) is applied at the
+/// exact boundary — e.g. Gemma 0→1 — rather than from a stale build-time value.
+pub fn current_tier(daa: u64) -> Option<u8> {
+    let (model_id, _) = MINING_TIER.get()?;
+    crate::models::pom_tier_index(model_id, daa)
+}
+
+fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
     let (model_id, gguf) = match MINING_TIER.get() {
         Some(x) => x,
         None => return false,
@@ -355,7 +366,7 @@ fn ensure_installed_inner(device_id: u32) -> bool {
     if crate::pom::active_index().is_none() {
         let _lk = index_build_lock().lock().ok();
         if crate::pom::active_index().is_none() {
-            let tier = match crate::models::pom_tier_index(model_id) {
+            let tier = match crate::models::pom_tier_index(model_id, daa) {
                 Some(t) => t,
                 None => return false,
             };
