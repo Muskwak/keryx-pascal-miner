@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <cstring>
 #include <chrono>
+#include <map>
 
 #define CUDA_CHECK(call) do { \
     cudaError_t err = call; \
@@ -434,6 +435,61 @@ int main(int argc, char** argv) {
         printf("  coal:   %.3f ms/batch -> %7.3f MH/s  (sequential, same 32B/step)\n", ms, mhs);
         printf("  (compare to bench's ~9.65 random — the gap = random-access efficiency loss)\n");
         cudaFree(buf_dev);
+        return 0;
+    }
+
+    // ---------- trace: analyze the walk's address sequence for exploitable locality ----------
+    // If consecutive `off` values cluster (same tensor, or within a few MB), a cache-friendly
+    // physical layout could exploit it. If jumps are uniformly random, no layout permutation
+    // can help (a bijection on a uniform distribution is still uniform). Reports the fraction of
+    // consecutive-step jumps that land in the same tensor / within 1MB / within 32MB.
+    if (strcmp(mode, "trace") == 0) {
+        const uint64_t NN = 64;          // nonces to trace
+        uint64_t same_tensor = 0, within_1mb = 0, within_32mb = 0, total_jumps = 0;
+        uint64_t tensor_visits = 0;      // distinct (nonce,step,lo) — to gauge tensor spread
+        uint64_t max_tensor_hits = 0;
+        std::map<uint32_t, uint64_t> tensor_hitcount;
+        for (uint64_t n = 0; n < NN; n++) {
+            uint64_t state = seed_fold_h(n, timestamp, p);
+            uint64_t off = host_fast_mod(state, mm.magic, mm.shift, g.n_chunks);
+            auto& pf = g.prefix_host;
+            uint32_t prev_lo = ~0u; uint64_t prev_off = 0;
+            for (uint32_t i = 0; i < K; i++) {
+                uint32_t lo = 0, hi = g.T;
+                while (lo + 1 < hi) { uint32_t mid = (lo + hi) >> 1; if (pf[mid] <= off) lo = mid; else hi = mid; }
+                uint64_t local = off - pf[lo];
+                const uint64_t* tp = g.tensor_host[lo].data();
+                uint64_t base = local * 4ULL;
+                uint64_t h = state;
+                h ^= tp[base]; h ^= tp[base+1]; h ^= tp[base+2]; h ^= tp[base+3];
+                state = mix64h(h);
+                tensor_hitcount[lo]++;
+                if (i > 0) {
+                    total_jumps++;
+                    if (lo == prev_lo) same_tensor++;
+                    uint64_t j = (off >= prev_off) ? (off - prev_off) : (prev_off - off);
+                    if (j < 31250) within_1mb++;      // 31250 chunks = 1 MiB
+                    if (j < 1000000) within_32mb++;   // ~32 MiB
+                }
+                prev_lo = lo; prev_off = off;
+                off = host_fast_mod(state, mm.magic, mm.shift, g.n_chunks);
+                (void)tensor_visits;
+            }
+        }
+        for (auto& kv : tensor_hitcount) max_tensor_hits = std::max(max_tensor_hits, kv.second);
+        printf("\ntrace: %llu nonces x %u steps = %llu consecutive jumps\n",
+               (unsigned long long)NN, K, (unsigned long long)total_jumps);
+        printf("  consecutive jumps landing in SAME tensor:    %5.1f%%\n",
+               100.0 * same_tensor / total_jumps);
+        printf("  consecutive jumps within 1 MiB:              %5.1f%%\n",
+               100.0 * within_1mb / total_jumps);
+        printf("  consecutive jumps within 32 MiB:             %5.1f%%\n",
+               100.0 * within_32mb / total_jumps);
+        printf("  distinct tensors hit: %zu of %u\n", tensor_hitcount.size(), g.T);
+        printf("  hottest tensor: %.1f%% of accesses (uniform would be %.2f%%)\n",
+               100.0 * max_tensor_hits / (NN * K), 100.0 / g.T);
+        printf("  (same-tensor/within-1MB near their uniform baselines => NO exploitable locality;\n");
+        printf("   well above baseline => a cache-friendly layout COULD help)\n");
         return 0;
     }
 
