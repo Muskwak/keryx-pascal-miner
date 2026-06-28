@@ -47,6 +47,7 @@ echo "==> staging output"
 cp "$SRC/target-linux-sm${SM_ARCH}/release/keryx-miner" "$OUT/"
 cp "$SRC/target-linux-sm${SM_ARCH}/release/libkeryxcuda.so" "$OUT/"
 cp "$SRC/target-linux-sm${SM_ARCH}/release/libkeryxopencl.so" "$OUT/"
+cp "$SRC/tests/install_cuda_deps.sh" "$OUT/"
 
 cat > "$OUT/README.txt" <<EOF
 Keryx Miner (Pascal Fork) v0.3.3 — Linux x86-64, sm_${SM_ARCH}
@@ -58,21 +59,19 @@ supporting the CUDA 12.x runtime.
 
 Files
 -----
-  keryx-miner       the miner
-  libkeryxcuda.so   CUDA PoW + inference plugin (REQUIRED for GPU mining)
-  libkeryxopencl.so OpenCL plugin (optional alternative backend)
+  keryx-miner            the miner
+  libkeryxcuda.so        CUDA PoW + inference plugin (REQUIRED for GPU mining)
+  libkeryxopencl.so      OpenCL plugin (optional alternative backend)
+  install_cuda_deps.sh   one-time dependency installer (sudo required)
 
-Quick start
------------
+Quick start (Ubuntu/Debian)
+---------------------------
+  sudo bash install_cuda_deps.sh          # one-time: installs CUDA 12.x runtime
   LD_LIBRARY_PATH=. ./keryx-miner --mining-address keryx:YOUR_ADDRESS --light
 
-Requirements
-------------
-  - NVIDIA driver supporting CUDA 12.x (>= 535)
-  - The two .so files MUST sit next to keryx-miner (or be on LD_LIBRARY_PATH)
-  - libcublas.so.12 + libcurand.so.10 from the CUDA 12.x runtime on the host
-    (on HiveOS the miner installs these on first run; otherwise install via
-    your package manager: libcublas-12-2, libcurand-12-2)
+The second command works on any Linux with glibc >= 2.35 and an NVIDIA driver
+supporting CUDA 12.x (driver >= 535). Set KERYX_CUDA_DEVICE=N to select a
+specific GPU when multiple are present.
 
 This fork charges a 2% maintainer fee by default (to the fork author).
 Disable with --devfund-percent=0.
