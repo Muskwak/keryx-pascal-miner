@@ -59,13 +59,17 @@ __device__ __forceinline__ bool pom_le_leq(const unsigned long long a[4],
 }
 
 // Find the tensor index whose [prefix[t], prefix[t+1]) chunk range contains `off`, using the
-// shared-memory copy of `prefix`. Returns lo such that prefix[lo] <= off < prefix[lo+1].
+// shared-memory copy of `prefix` (u32 halves smem — chunk counts fit in 32 bits up to ~137B).
+// Returns lo such that prefix[lo] <= off < prefix[lo+1].
 //
 // Predicated binary search: `selp` replaces branches, keeping the warp fully converged — no
 // serialized paths. On Pascal the if/else variant causes up to ~8× serialization with 500+
 // tensors (observed 100% GPU util / 10% mem util → compute-limited by divergence). Fully unrolled
 // 10 iterations covers T <= 1024; converged threads run NOP predications on the tail iterations.
-__device__ __forceinline__ unsigned int find_tensor(const unsigned long long* __restrict__ sprefix,
+//
+// u32 prefix halves shared memory vs u64: 2 KB vs 4 KB for 501 tensors → occupancy 100% vs 75%
+// on P40 (48 KB smem / SM), giving the warp scheduler 64 vs 48 warps/SM to hide memory latency.
+__device__ __forceinline__ unsigned int find_tensor(const unsigned int* __restrict__ sprefix,
                                                     unsigned int T, unsigned long long off) {
     unsigned int lo = 0, hi = T, mid, pred;
     // Manually unrolled: each line = one binary-search step with no branch (setp + selp + selp).
@@ -106,7 +110,7 @@ __device__ __forceinline__ unsigned long long fast_mod(unsigned long long a,
 
 __global__ void pom_mine(
     const unsigned long long* __restrict__ bases,
-    const unsigned long long* __restrict__ prefix,
+    const unsigned int* __restrict__ prefix,
     unsigned int T,
     unsigned long long n_total_chunks, unsigned int K,
     unsigned long long magic, unsigned int shift,
@@ -116,7 +120,7 @@ __global__ void pom_mine(
     unsigned long long nonce_base, unsigned long long n_nonces,
     unsigned long long* winner) {
 
-    extern __shared__ unsigned long long sprefix[];  // shared copy of prefix[0..T]
+    extern __shared__ unsigned int sprefix[];  // shared copy of prefix[0..T] (u32 -> 2 KB, 100% occupancy)
 
     // Cooperative load of the offset table into shared memory — every thread in the block
     // touches the table ~256× per nonce; smem latency (~20 cyc) beats global (~400 cyc) hard.

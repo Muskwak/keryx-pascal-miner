@@ -133,11 +133,11 @@ static bool verify_mod(const ModMagic& m, uint64_t d) {
 #include <array>
 struct Gather {
     uint64_t* bases = nullptr;    // device: T entries, each a device ptr to that tensor's u64 chunks
-    uint64_t* prefix = nullptr;   // device: T+1 entries, canonical chunk offsets
+    uint32_t* prefix = nullptr;   // device: T+1 entries, canonical chunk offsets (u32 halves smem)
     uint32_t  T = 0;
     uint64_t  n_chunks = 0;
     std::vector<uint64_t*> tensor_dev;  // owns the per-tensor device buffers
-    std::vector<uint64_t> prefix_host;  // host mirror of prefix (for the CPU walk / bit-exact check)
+    std::vector<uint32_t> prefix_host;  // host mirror of prefix (for the CPU walk / bit-exact check)
     // Host mirrors of each tensor's u64 chunk data, kept so the CPU reference walk can read the
     // exact same bytes the GPU gathers — the bit-exact check XOR-folds these to compare against
     // the kernel's winner. Indexed tensor_host[lo] points at sz*4 contiguous u64s.
@@ -185,8 +185,8 @@ static Gather build_gather(uint64_t target_chunks, uint32_t target_tensors) {
     for (uint32_t i = 0; i < g.T; i++) bases_host[i] = (uint64_t)g.tensor_dev[i];
     CUDA_CHECK(cudaMalloc(&g.bases, (size_t)g.T * 8));
     CUDA_CHECK(cudaMemcpy(g.bases, bases_host.data(), (size_t)g.T * 8, cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMalloc(&g.prefix, (size_t)(g.T + 1) * 8));
-    CUDA_CHECK(cudaMemcpy(g.prefix, g.prefix_host.data(), (size_t)(g.T + 1) * 8, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMalloc(&g.prefix, (size_t)(g.T + 1) * 4));
+    CUDA_CHECK(cudaMemcpy(g.prefix, g.prefix_host.data(), (size_t)(g.T + 1) * 4, cudaMemcpyHostToDevice));
     return g;
 }
 
@@ -195,7 +195,7 @@ static double launch(const Gather& g, const ModMagic& mm, uint64_t p[4], uint64_
                      uint64_t timestamp, uint64_t nonce_base, uint64_t batch, uint64_t* winner_dev) {
     CUDA_CHECK(cudaMemset(winner_dev, 0xff, 8));
     uint32_t grid = (uint32_t)((batch + THREADS - 1) / THREADS);
-    size_t smem = (size_t)(g.T + 1) * 8;
+    size_t smem = (size_t)(g.T + 1) * 4;
     cudaEvent_t a, b; cudaEventCreate(&a); cudaEventCreate(&b);
     cudaEventRecord(a);
     pom_mine<<<grid, THREADS, smem>>>(
