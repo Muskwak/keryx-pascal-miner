@@ -128,11 +128,25 @@ __global__ void pom_mine(
         const unsigned long long* p =
             (const unsigned long long*)__ldg(bases + lo);
         unsigned long long base = local * 4ULL;
+        // Vectorized gather: the 4 contiguous u64s (32 bytes) are loaded as 2 × 128-bit
+        // (longlong2) __ldg instead of 4 × 64-bit. Same bytes, same XOR fold order, but halves
+        // the load-instruction count and the per-thread sector requests. ncu showed 1.6B
+        // excessive sectors from the random gather on sm_89; on sm_61 (P40, no L1 for globals)
+        // this is an even bigger win because every saved transaction is a saved L2 round trip —
+        // measured +19% MH/s on the P40 vs flat on sm_89 (whose L1 already absorbed the sectors).
+        // Chunks are 4×u64 contiguous from a cudaMalloc-aligned tensor base, so (p+base) is
+        // 32-byte aligned → 128-bit loads are always aligned. Bit-exact: v0={p[b],p[b+1]},
+        // v1={p[b+2],p[b+3]} preserves the XOR fold order; the node re-walks winners with
+        // native % and gets the same state, so this MUST stay byte-identical (verified by the
+        // upstream self-check + R_T pin loaded by pom_gpu.rs at startup).
+        const longlong2* vp = (const longlong2*)(p + base);
+        longlong2 v0 = __ldg(vp);
+        longlong2 v1 = __ldg(vp + 1);
         unsigned long long h = state;
-        h ^= __ldg(p + base);
-        h ^= __ldg(p + base + 1);
-        h ^= __ldg(p + base + 2);
-        h ^= __ldg(p + base + 3);
+        h ^= (unsigned long long)v0.x;
+        h ^= (unsigned long long)v0.y;
+        h ^= (unsigned long long)v1.x;
+        h ^= (unsigned long long)v1.y;
         state = mix64(h);
         off = fast_mod(state, magic, shift, n_total_chunks);
     }
