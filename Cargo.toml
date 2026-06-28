@@ -96,5 +96,13 @@ default-members = [".", "plugins/cuda", "plugins/opencl"]
 # sm_80+, which would exclude Turing/Pascal (and thus all pre-Ampere miners) from
 # inference. The vendored copy guards those kernel bodies with `#if __CUDA_ARCH__
 # >= 800` so the crate builds at sm_75 (stub on older archs, real MoE on sm_80+).
+#
+# Vendored candle-transformers: the upstream quantized_gemma3::ModelWeights keeps its
+# QMatMul weight fields private, so the PoM zero-dup gather (which needs to reuse the
+# inference engine's resident weight tensors instead of loading a duplicate ~2GB copy)
+# can't reach them — on a 6GB card (RTX 4050) the duplicate blows VRAM and pages over
+# PCIe (0.2/7.95 ≈ 2.5% throughput). The vendored copy adds a `pom_quant_tensors()`
+# accessor mirroring quantized_llama_split, so pom_shared() can share Gemma weights.
 [patch.crates-io]
 candle-kernels = { path = "vendor/candle-kernels" }
+candle-transformers = { path = "vendor/candle-transformers" }

@@ -999,9 +999,6 @@ pub fn load_and_run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usi
             if let Some(ref old) = *guard {
                 log::info!("SlmEngine: evicting '{}' to load '{}'", old.name, spec.name);
             }
-            // Inference has priority over PoW: release the GPU miner's hold on the resident mining
-            // weights so this model fits. Mining rebuilds (reloads its model) when it next runs.
-            crate::pom_gpu::uninstall();
             *guard = None;
             let device = match Device::new_cuda(0) {
                 Ok(d) => { log::info!("SlmEngine: CUDA device 0 active"); d }
@@ -1010,12 +1007,34 @@ pub fn load_and_run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usi
                     return None;
                 }
             };
-            match load_engine(spec, device) {
-                Ok(e) => { *guard = Some(e); }
-                Err(e) => {
-                    log::error!("SlmEngine: failed to load '{}': {}", spec.name, e);
-                    return None;
+            // Inference has priority over PoW. Try loading the inference model WITHOUT
+            // evicting the GPU miner first — on cards with plentiful VRAM (e.g., 24 GB P40)
+            // the miner and inference model coexist, so the miner stays resident and skips
+            // the costly gather rebuild on the next batch. On tight cards (e.g., 6 GB 4050)
+            // the allocation OOMs; we catch it, evict, and retry.
+            let maybe_engine = match load_engine(spec, device) {
+                Ok(e) => Some(e),
+                Err(first_err) => {
+                    log::info!("SlmEngine: first-load failed ({}), evicting PoM miner and retrying…", first_err);
+                    crate::pom_gpu::uninstall();
+                    let device = match Device::new_cuda(0) {
+                        Ok(d) => d,
+                        Err(e) => {
+                            log::error!("SlmEngine: CUDA unavailable on retry: {}", e);
+                            return None;
+                        }
+                    };
+                    match load_engine(spec, device) {
+                        Ok(e) => Some(e),
+                        Err(second_err) => {
+                            log::error!("SlmEngine: failed to load '{}' even after evicting miner: {}", spec.name, second_err);
+                            return None;
+                        }
+                    }
                 }
+            };
+            if let Some(e) = maybe_engine {
+                *guard = Some(e);
             }
         }
 
@@ -1097,6 +1116,11 @@ pub fn pom_shared(
     match &e.inner {
         ModelInner::QuantizedQwen3Split(m) => Some((e.device.clone(), m.pom_quant_tensors())),
         ModelInner::QuantizedSplit(m) => Some((e.device.clone(), m.pom_quant_tensors())),
+        // Gemma-3-4B (baseline --light tier): candle's quantized_gemma3 keeps weight fields
+        // private, so the keryx fork adds pom_quant_tensors(). Sharing these lets the PoM walk
+        // reuse the inference engine's resident weights instead of loading a duplicate ~2GB
+        // copy — critical on 6GB cards (RTX 4050) where the dup blows VRAM and pages over PCIe.
+        ModelInner::QuantizedGemma3(m) => Some((e.device.clone(), m.pom_quant_tensors())),
         _ => None,
     }
 }
