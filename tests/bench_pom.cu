@@ -36,6 +36,32 @@
 // invocation compiles kernel + bench together at the target arch.
 #include "../cuda/pom_mine.cu"
 
+// ---- Pure-compute isolation kernel: the walk with the gather REMOVED ----------------------
+// Replaces the 4-u64 __ldg gather + XOR fold with a single register-constant XOR (the gather's
+// value simulated as a fixed reg, so the compiler can't fold it away but also can't stall on
+// memory). Same mix64 + fast_mod + K-step serial chain. The MH/s here is the ALU-only ceiling:
+// if it's ~equal to the real kernel, the gather is fully hidden and we're compute-bound on
+// mix64/fast_mod (the lever is cheaper math); if it's much higher, the gather still costs latency.
+__global__ void pom_mine_compute(
+    unsigned long long n_total_chunks, unsigned int K,
+    unsigned long long magic, unsigned int shift,
+    unsigned long long p0, unsigned long long p1, unsigned long long p2, unsigned long long p3,
+    unsigned long long time_,
+    unsigned long long nonce_base, unsigned long long n_nonces,
+    unsigned long long* winner, unsigned long long target_val) {
+    unsigned long long gid = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= n_nonces) return;
+    unsigned long long nonce = nonce_base + gid;
+    unsigned long long state = pom_seed_fold(nonce, time_, p0, p1, p2, p3);
+    unsigned long long off = fast_mod(state, magic, shift, n_total_chunks);
+    for (unsigned int i = 0; i < K; i++) {
+        unsigned long long h = state ^ target_val;   // gather simulated as a fixed register value
+        state = mix64(h);
+        off = fast_mod(state, magic, shift, n_total_chunks);
+    }
+    if (state <= target_val) atomicMin(winner, nonce);
+}
+
 // ---- Constants mirroring src/pom.rs + src/miner.rs ------------------------------------
 static constexpr uint32_t K = 256;            // POM_WALK_STEPS
 static constexpr uint64_t POM_BATCH = 1ull << 21;   // src/miner.rs POM_BATCH (2M nonces/launch)
@@ -156,7 +182,11 @@ static Gather build_gather(uint64_t target_chunks, uint32_t target_tensors) {
     for (uint32_t t = 0; t < target_tensors && made < target_chunks; t++) {
         seed = mix64h(seed);
         uint64_t sz;
-        if (t < target_tensors / 4) {
+        if (target_tensors == 1) {
+            // Single-tensor isolation mode: one contiguous buffer of the full size (no binary
+            // search needed — used by `notier` to isolate gather+mix64+fast_mod cost).
+            sz = target_chunks;
+        } else if (t < target_tensors / 4) {
             // big tensors: each ~30-50% of remaining, so a few dominate (like real FFN weights)
             uint64_t remaining = target_chunks - made;
             sz = remaining / (4 + (seed % 4));
@@ -192,13 +222,14 @@ static Gather build_gather(uint64_t target_chunks, uint32_t target_tensors) {
 
 // ---- Launch the kernel exactly like pom_gpu.rs::mine() --------------------------------
 static double launch(const Gather& g, const ModMagic& mm, uint64_t p[4], uint64_t tg[4],
-                     uint64_t timestamp, uint64_t nonce_base, uint64_t batch, uint64_t* winner_dev) {
+                     uint64_t timestamp, uint64_t nonce_base, uint64_t batch, uint64_t* winner_dev,
+                     uint32_t threads = THREADS) {
     CUDA_CHECK(cudaMemset(winner_dev, 0xff, 8));
-    uint32_t grid = (uint32_t)((batch + THREADS - 1) / THREADS);
+    uint32_t grid = (uint32_t)((batch + threads - 1) / threads);
     size_t smem = (size_t)(g.T + 1) * 4;
     cudaEvent_t a, b; cudaEventCreate(&a); cudaEventCreate(&b);
     cudaEventRecord(a);
-    pom_mine<<<grid, THREADS, smem>>>(
+    pom_mine<<<grid, threads, smem>>>(
         g.bases, g.prefix, g.T, g.n_chunks, K, mm.magic, mm.shift,
         p[0], p[1], p[2], p[3], timestamp,
         tg[0], tg[1], tg[2], tg[3],
@@ -249,8 +280,16 @@ int main(int argc, char** argv) {
     // box (e.g. --device 1 to target the P40 when the 1070 is device 0) without fighting
     // CUDA_VISIBLE_DEVICES ordering quirks across driver/CUDA versions.
     int dev = 0;
-    for (int i = 2; i < argc; i++) {            // scan all args past mode for --device N
+    for (int i = 2; i < argc; i++) {            // scan all args past mode for --device / --chunks
         if (!strcmp(argv[i], "--device") && i + 1 < argc) dev = atoi(argv[++i]);
+    }
+    // Override the synthetic gather size (in chunks) to A/B tier throughput: Gemma-3-4B ≈ 77.8M
+    // chunks (~2.5 GB), Qwen3-32B Q4_K_M ≈ 609M chunks (~19.5 GB). Lets us confirm that the
+    // observed --high vs --light MH/s gap is the memory-bandwidth wall (random gathers over a 5×
+    // larger blob → near-zero L2 reuse), not a kernel regression.
+    uint64_t chunks_arg = 0;
+    for (int i = 2; i < argc; i++) {
+        if (!strcmp(argv[i], "--chunks") && i + 1 < argc) chunks_arg = strtoull(argv[++i], nullptr, 10);
     }
     CUDA_CHECK(cudaSetDevice(dev));
     cudaDeviceProp prop; CUDA_CHECK(cudaGetDeviceProperties(&prop, dev));
@@ -258,8 +297,9 @@ int main(int argc, char** argv) {
            prop.name, prop.major, prop.minor, prop.multiProcessorCount,
            (int)(prop.l2CacheSize / 1024));
 
-    // Realistic chunk count for Gemma-3-4B at 32B/chunk: ~77.8M (2.49GB / 32).
-    uint64_t target_chunks = 77809197;
+    // Realistic chunk count for Gemma-3-4B at 32B/chunk: ~77.8M (2.49GB / 32). Override with
+    // --chunks N (e.g. 609M for Qwen3-32B) to A/B tier throughput at the bandwidth wall.
+    uint64_t target_chunks = chunks_arg ? chunks_arg : 77809197;
     printf("Building synthetic gather (N=%llu chunks, ~%.1f GB)...\n",
            (unsigned long long)target_chunks, target_chunks * 32.0 / 1e9);
     // 444 tensors = the real Gemma-3-4B GGUF tensor count (verified from its header). Keeps the
@@ -279,6 +319,75 @@ int main(int argc, char** argv) {
     uint64_t tg[4] = {0,0,0,0};   // target=0 → no winner, clean timing
     uint64_t timestamp = 0xABCD;
     uint64_t* winner_dev; CUDA_CHECK(cudaMalloc(&winner_dev, 8));
+
+    // ---------- notier: isolate gather+mix64+fast_mod cost (single contiguous buffer, T=1) ----
+    // Builds a single-tensor gather (no binary search needed: lo is always 0, local==off) at the
+    // SAME total chunk count, then runs the real kernel over it. The MH/s delta vs the multi-tensor
+    // bench isolates the find_tensor binary-search cost per step — the prime compute-bound suspect.
+    if (strcmp(mode, "notier") == 0) {
+        Gather g1 = build_gather(g.n_chunks, 1);   // same N, T=1
+        ModMagic mm1 = mod_magic_for_chunks(g1.n_chunks);
+        if (!verify_mod(mm1, g1.n_chunks)) mm1 = {0, 0};
+        printf("\nnotier (T=1, same N=%llu): binary search is a no-op\n", (unsigned long long)g1.n_chunks);
+        for (int i = 0; i < 20; i++) launch(g1, mm1, p, tg, timestamp, i * POM_BATCH, POM_BATCH, winner_dev);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        double total = 0; int iters = 50;
+        for (int i = 0; i < iters; i++)
+            total += launch(g1, mm1, p, tg, timestamp, i * POM_BATCH, POM_BATCH, winner_dev);
+        double ms = total / iters;
+        double mhs = (double)POM_BATCH / (ms / 1000.0) / 1e6;
+        printf("  notier: %.3f ms/batch -> %.3f MH/s  (compare to bench's multi-tensor figure)\n", ms, mhs);
+        return 0;
+    }
+
+    // ---------- compute: ALU-only ceiling (gather removed, mix64+fast_mod chain only) --------
+    // If compute MH/s ≈ real MH/s, the gather is fully latency-hidden and the lever is cheaper
+    // math per step (not more memory parallelism). If compute ≫ real, the gather still costs.
+    if (strcmp(mode, "compute") == 0) {
+        CUDA_CHECK(cudaMemset(winner_dev, 0xff, 8));
+        uint32_t threads = THREADS, grid = (uint32_t)((POM_BATCH + threads - 1) / threads);
+        for (int i = 0; i < 20; i++) {
+            pom_mine_compute<<<grid, threads>>>(g.n_chunks, K, mm.magic, mm.shift,
+                p[0], p[1], p[2], p[3], timestamp, i * POM_BATCH, POM_BATCH, winner_dev, 0);
+        }
+        CUDA_CHECK(cudaDeviceSynchronize());
+        double total = 0; int iters = 50;
+        for (int i = 0; i < iters; i++) {
+            cudaEvent_t a, b; cudaEventCreate(&a); cudaEventCreate(&b);
+            cudaEventRecord(a);
+            pom_mine_compute<<<grid, threads>>>(g.n_chunks, K, mm.magic, mm.shift,
+                p[0], p[1], p[2], p[3], timestamp, i * POM_BATCH, POM_BATCH, winner_dev, 0);
+            CUDA_CHECK(cudaGetLastError());
+            cudaEventRecord(b); cudaEventSynchronize(b);
+            float ms = 0; cudaEventElapsedTime(&ms, a, b);
+            cudaEventDestroy(a); cudaEventDestroy(b);
+            total += ms;
+        }
+        double ms = total / iters;
+        double mhs = (double)POM_BATCH / (ms / 1000.0) / 1e6;
+        printf("\ncompute (gather removed, ALU chain only): %.3f ms/batch -> %.3f MH/s\n", ms, mhs);
+        return 0;
+    }
+
+    // ---------- batchsweep: total-threads sweep to find latency-hiding saturation ------------
+    // The walk is serial per-thread (each gather depends on the previous XOR), so latency is only
+    // hidden by OTHER threads' in-flight gathers. If MH/s saturates as batch grows, we've hit the
+    // memory-subsystem request limit; if it keeps rising, we're latency-starved (need more threads).
+    if (strcmp(mode, "batchsweep") == 0) {
+        printf("\ntotal-threads (batch) sweep:\n");
+        for (uint64_t b : {1ull<<16, 1ull<<18, 1ull<<20, 1ull<<22, 1ull<<24}) {
+            for (int i = 0; i < 15; i++) launch(g, mm, p, tg, timestamp, i * b, b, winner_dev);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            double total = 0; int iters = 30;
+            for (int i = 0; i < iters; i++)
+                total += launch(g, mm, p, tg, timestamp, i * b, b, winner_dev);
+            double ms = total / iters;
+            double mhs = (double)b / (ms / 1000.0) / 1e6;
+            printf("  batch=%7llu (%6.1fK threads): %.3f ms -> %7.3f MH/s\n",
+                   (unsigned long long)b, b / 1000.0, ms, mhs);
+        }
+        return 0;
+    }
 
     // ---------- check: bit-exact GPU-vs-CPU walk over a small batch ----------
     // The correctness gate for any kernel change (vectorized gather, magic modulo, etc.).
@@ -326,6 +435,26 @@ int main(int argc, char** argv) {
             printf("  RESULT: FAIL — kernel diverged from CPU reference walk!\n");
             return 1;
         }
+    }
+
+    // ---------- sweep: threads-per-block sweep to find the optimal block size ----------
+    // The walk is latency-bound on the random gather; more threads/block = more independent
+    // gathers in flight per SM to hide that latency. Smem is ~constant (T+1 u32), so occupancy is
+    // limited by registers/threads, not smem — until a block size starves an SM of blocks.
+    if (strcmp(mode, "sweep") == 0) {
+        printf("\nthreads/block sweep (batch=%llu):\n", (unsigned long long)POM_BATCH);
+        for (uint32_t th : {64u, 128u, 256u, 512u, 1024u}) {
+            for (int i = 0; i < 20; i++) launch(g, mm, p, tg, timestamp, i * POM_BATCH, POM_BATCH, winner_dev, th);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            double total = 0;
+            int iters = 30;
+            for (int i = 0; i < iters; i++)
+                total += launch(g, mm, p, tg, timestamp, i * POM_BATCH, POM_BATCH, winner_dev, th);
+            double ms = total / iters;
+            double mhs = (double)POM_BATCH / (ms / 1000.0) / 1e6;
+            printf("  %4u threads: %.3f ms/batch -> %.3f MH/s\n", th, ms, mhs);
+        }
+        return 0;
     }
 
     // ---------- bit-exact check: GPU walk vs CPU walk for a few nonces ----------
