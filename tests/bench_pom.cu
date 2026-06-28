@@ -62,6 +62,36 @@ __global__ void pom_mine_compute(
     if (state <= target_val) atomicMin(winner, nonce);
 }
 
+// ---- Coalesced-gather kernel: SAME 32B/step volume, but warp-aligned sequential reads --------
+// Isolates the cost of RANDOM access vs SEQUENTIAL. The real kernel gathers a random 32B chunk
+// per step (scattered across the blob → no coalescing, GDDR row-buffer thrashing). This variant
+// reads 32B per step too, but at a SEQUENTIAL address (base + step*32) so the warp coalesces into
+// a single 1KB transaction. If coalesced ≫ random, the random-access pattern is the efficiency
+// gap, and the lever is locality — NOT more bandwidth. Uses ONE contiguous buffer (T=1 layout).
+__global__ void pom_mine_coalesced(
+    const unsigned long long* __restrict__ buf, unsigned long long buf_elts,
+    unsigned long long n_total_chunks, unsigned int K,
+    unsigned long long magic, unsigned int shift,
+    unsigned long long p0, unsigned long long p1, unsigned long long p2, unsigned long long p3,
+    unsigned long long time_,
+    unsigned long long nonce_base, unsigned long long n_nonces,
+    unsigned long long* winner) {
+    unsigned long long gid = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= n_nonces) return;
+    unsigned long long nonce = nonce_base + gid;
+    unsigned long long state = pom_seed_fold(nonce, time_, p0, p1, p2, p3);
+    unsigned long long off = fast_mod(state, magic, shift, n_total_chunks);
+    for (unsigned int i = 0; i < K; i++) {
+        // Sequential address (warp-coalesced across threads), same 4-u64 = 32B per thread.
+        unsigned long long seq = (gid * K + i) & (buf_elts - 4);   // mask leaves room for seq+3
+        unsigned long long h = state ^ buf[seq];
+        h ^= buf[seq + 1]; h ^= buf[seq + 2]; h ^= buf[seq + 3];
+        state = mix64(h);
+        off = fast_mod(state, magic, shift, n_total_chunks);
+    }
+    if (state == 0) atomicMin(winner, nonce);   // dummy, never true; just to keep the write
+}
+
 // ---- Constants mirroring src/pom.rs + src/miner.rs ------------------------------------
 static constexpr uint32_t K = 256;            // POM_WALK_STEPS
 static constexpr uint64_t POM_BATCH = 1ull << 21;   // src/miner.rs POM_BATCH (2M nonces/launch)
@@ -366,6 +396,44 @@ int main(int argc, char** argv) {
         double ms = total / iters;
         double mhs = (double)POM_BATCH / (ms / 1000.0) / 1e6;
         printf("\ncompute (gather removed, ALU chain only): %.3f ms/batch -> %.3f MH/s\n", ms, mhs);
+        return 0;
+    }
+
+    // ---------- coal: coalesced (sequential) gather — isolates random-access efficiency loss ---
+    // Same 32B/step as the real kernel, but warp-coalesced. If coal ≫ bench, the random pattern
+    // (not raw bandwidth) is the wall — GDDR row-buffer thrashing wastes ~75% of peak BW on the
+    // scattered reads. That's the gap between 23% efficiency and 100%.
+    if (strcmp(mode, "coal") == 0) {
+        // Need a pow2-sized contiguous buffer for the & mask. Use the largest pow2 <= n_chunks.
+        uint64_t buf_elts = 1; while (buf_elts * 2 <= (1ull << 25)) buf_elts *= 2;  // 256 MiB (u64 elts), leaves headroom for seq+3
+        uint64_t* buf_dev; size_t buf_bytes = buf_elts * 8;
+        CUDA_CHECK(cudaMalloc(&buf_dev, buf_bytes));
+        std::vector<uint64_t> fill(buf_elts);
+        for (uint64_t i = 0; i < buf_elts; i++) fill[i] = mix64h(i * 0x9E3779B97F4A7C15ULL);
+        CUDA_CHECK(cudaMemcpy(buf_dev, fill.data(), buf_bytes, cudaMemcpyHostToDevice));
+        printf("\ncoal (sequential coalesced gather, buf=%llu MiB):\n", (unsigned long long)(buf_bytes/1048576));
+        uint32_t threads = THREADS, grid = (uint32_t)((POM_BATCH + threads - 1) / threads);
+        for (int i = 0; i < 20; i++)
+            pom_mine_coalesced<<<grid, threads>>>(buf_dev, buf_elts, g.n_chunks, K, mm.magic, mm.shift,
+                p[0],p[1],p[2],p[3], timestamp, i*POM_BATCH, POM_BATCH, winner_dev);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        double total = 0; int iters = 50;
+        for (int i = 0; i < iters; i++) {
+            cudaEvent_t a, b; cudaEventCreate(&a); cudaEventCreate(&b);
+            cudaEventRecord(a);
+            pom_mine_coalesced<<<grid, threads>>>(buf_dev, buf_elts, g.n_chunks, K, mm.magic, mm.shift,
+                p[0],p[1],p[2],p[3], timestamp, i*POM_BATCH, POM_BATCH, winner_dev);
+            CUDA_CHECK(cudaGetLastError());
+            cudaEventRecord(b); cudaEventSynchronize(b);
+            float ms = 0; cudaEventElapsedTime(&ms, a, b);
+            cudaEventDestroy(a); cudaEventDestroy(b);
+            total += ms;
+        }
+        double ms = total / iters;
+        double mhs = (double)POM_BATCH / (ms / 1000.0) / 1e6;
+        printf("  coal:   %.3f ms/batch -> %7.3f MH/s  (sequential, same 32B/step)\n", ms, mhs);
+        printf("  (compare to bench's ~9.65 random — the gap = random-access efficiency loss)\n");
+        cudaFree(buf_dev);
         return 0;
     }
 
