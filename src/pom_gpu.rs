@@ -28,6 +28,64 @@ fn words4(b: &[u8; 32]) -> [u64; 4] {
     w
 }
 
+/// Magic numbers for bit-exact unsigned modulo by a runtime-constant divisor (Lemire's method).
+/// The kernel computes `rem = a - ((a * magic) >> shift) * d`, replacing a ~30-instruction
+/// microcoded `rem.u64` on the walk's critical path with one `mul.hi` + shifts. `magic == 0`
+/// is a sentinel telling the kernel to fall back to plain `%` (only used when self-test fails).
+struct ModMagic { magic: u64, shift: u32 }
+
+/// Compute `(magic, shift)` so that `q = (a * magic) >> shift == a / d` for all u64 a, then
+/// `rem = a - q*d == a % d`. Returns magic=0 if d is 0/1 (no division needed) — the kernel
+/// treats magic=0 as "use plain %" so correctness holds trivially in those cases.
+fn mod_magic(d: u64) -> ModMagic {
+    if d <= 1 {
+        return ModMagic { magic: 0, shift: 0 };
+    }
+    // Lemire "unbounded" variant: shift = 64 + floor(log2(d)); magic = ceil(2^(64+shift) / d).
+    // Using u128 for the constant computation keeps it exact and simple.
+    let shift = (64 - (d as u64).leading_zeros()) + 64;
+    // 2^shift / d rounded up. shift >= 65 here, so build the 128-bit numerator carefully.
+    let num = if shift >= 128 {
+        u128::MAX / d as u128 + 1 // 2^128 ≈ u128::MAX+1; +1 rounds the quotient up
+    } else {
+        ((1u128 << shift) + d as u128 - 1) / d as u128
+    };
+    // magic fits in 64 bits for d > 1 with this shift choice (Lemire's bound). If it doesn't,
+    // bail to the sentinel so we never pass a wrong value.
+    if num > u64::MAX as u128 {
+        return ModMagic { magic: 0, shift: 0 };
+    }
+    ModMagic { magic: num as u64, shift }
+}
+
+/// Verify a ModMagic against native `%` over random inputs. The node re-walks the winning nonce
+/// with native `%`, so the GPU's `fast_mod` MUST be bit-identical; this guard refuses to use the
+/// fast path unless it matches for every sampled value. Returns false → caller falls back to `%`.
+fn verify_mod_magic(m: &ModMagic, d: u64) -> bool {
+    if m.magic == 0 { return false; }
+    let mut rng = 0u64;
+    for _ in 0..1_000_000 {
+        // splitmix64-style PRNG — deterministic so a failure is reproducible.
+        rng = rng.wrapping_add(0x9E3779B97F4A7C15);
+        let mut z = rng;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+        z ^= z >> 31;
+        let q = ((z as u128).wrapping_mul(m.magic as u128) >> m.shift) as u64;
+        if z - q.wrapping_mul(d) != z % d {
+            return false;
+        }
+    }
+    // Edge cases that often expose off-by-one in magic constants:
+    for &z in &[0u64, 1, d - 1, d, d + 1, u64::MAX, d.wrapping_mul(2)] {
+        let q = ((z as u128).wrapping_mul(m.magic as u128) >> m.shift) as u64;
+        if z - q.wrapping_mul(d) != z % d {
+            return false;
+        }
+    }
+    true
+}
+
 pub struct PomGpuMiner {
     cuda: CudaDevice,
     stream: Arc<CudaStream>,
@@ -156,6 +214,17 @@ impl PomGpuMiner {
         let p = words4(pre_pow_hash);
         let t = words4(target_le);
         let k = crate::pom::POM_WALK_STEPS;
+        // Precompute the magic-number modulo for n_total_chunks once per launch. The kernel uses
+        // it to replace the per-step `rem.u64` (a ~30-instr microcoded divide) with a mulhi+shift.
+        // Self-tested against native `%` for bit-exactness; if verification fails, magic=0 makes
+        // the kernel fall back to plain `%` (correctness preserved, just no speedup).
+        let m = mod_magic(self.n_total_chunks);
+        let (magic, shift) = if verify_mod_magic(&m, self.n_total_chunks) {
+            (m.magic, m.shift)
+        } else {
+            log::warn!("PoM: magic-number modulo self-test failed for n_chunks={}, using plain %", self.n_total_chunks);
+            (0u64, 0u32)
+        };
         let winner = self.stream.clone_htod(&[u64::MAX]).map_err(candle_core::Error::wrap)?;
         let grid = ((batch + 127) / 128) as u32;
         // The P40 kernel cooperatively loads prefix[0..T] into dynamic shared memory (smem
@@ -167,6 +236,7 @@ impl PomGpuMiner {
         let func = self.cuda.get_or_load_custom_func("pom_mine", "pom_mine_mod", PTX)?; // cached
         let mut b = func.builder();
         b.arg(&self.bases_dev).arg(&self.prefix_dev).arg(&self.t_count).arg(&self.n_total_chunks).arg(&k)
+            .arg(&magic).arg(&shift)
             .arg(&p[0]).arg(&p[1]).arg(&p[2]).arg(&p[3]).arg(&timestamp)
             .arg(&t[0]).arg(&t[1]).arg(&t[2]).arg(&t[3])
             .arg(&start).arg(&batch).arg(&winner);

@@ -440,7 +440,19 @@ impl WeightIndex {
         // Tree temp file next to the GGUF (disk-backed; /tmp may be tmpfs = RAM).
         let dir = std::path::Path::new(path).parent().unwrap_or_else(|| std::path::Path::new("."));
         let tree_path = dir.join(format!("pom-tree-{}.bin", std::process::id()));
-        let _ = std::fs::remove_file(&tree_path); // clear a stale file from a crashed run
+        // Sweep ALL stale pom-tree-*.bin orphans, not just our own PID. Each is named by the PID
+        // that wrote it; a leftover means that process crashed/was killed before cleanup ran, and
+        // they can be GBs each (one per dead miner). The file we're about to create is fresh, so
+        // any existing pom-tree-*.bin is by definition stale. Best-effort: ignore errors.
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name.starts_with("pom-tree-") && name.ends_with(".bin") {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
         let mut writer = BufWriter::new(
             OpenOptions::new().read(true).write(true).create(true).truncate(true)
                 .open(&tree_path).map_err(candle_core::Error::wrap)?,

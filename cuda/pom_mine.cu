@@ -70,11 +70,34 @@ __device__ __forceinline__ unsigned int find_tensor(const unsigned long long* __
     return lo;
 }
 
+// High half of a 64x64->128 unsigned multiply. nvcc has no intrinsic for the u64 high half on
+// sm_61, so emit the PTX directly. This is the one building block the magic-number modulo needs
+// that the compiler won't generate from C alone.
+__device__ __forceinline__ unsigned long long mulhi64(unsigned long long a, unsigned long long b) {
+    unsigned long long hi;
+    asm("mul.hi.u64 %0, %1, %2;" : "=l"(hi) : "l"(a), "l"(b));
+    return hi;
+}
+
+// Bit-exact unsigned modulo for a divisor that is constant for the whole kernel launch but not
+// known at compile time. The host precomputes (magic, shift, d) for n_total_chunks via Lemire's
+// method and passes them as args; magic==0 is a sentinel meaning "use plain %". Computes q = a/d
+// via q = (a * magic) >> shift (a single mulhi + shift), then rem = a - q*d. Uniform across the
+// warp (magic/shift/d are per-launch, not per-thread) so the branch is warp-coherent — no divergence.
+__device__ __forceinline__ unsigned long long fast_mod(unsigned long long a,
+                                                       unsigned long long magic, unsigned int shift,
+                                                       unsigned long long d) {
+    if (magic == 0) return a % d;
+    unsigned long long q = mulhi64(a, magic) >> shift;
+    return a - q * d;
+}
+
 __global__ void pom_mine(
     const unsigned long long* __restrict__ bases,
     const unsigned long long* __restrict__ prefix,
     unsigned int T,
     unsigned long long n_total_chunks, unsigned int K,
+    unsigned long long magic, unsigned int shift,
     unsigned long long p0, unsigned long long p1, unsigned long long p2, unsigned long long p3,
     unsigned long long time_,
     unsigned long long t0, unsigned long long t1, unsigned long long t2, unsigned long long t3,
@@ -96,7 +119,7 @@ __global__ void pom_mine(
     unsigned long long nonce = nonce_base + gid;
 
     unsigned long long state = pom_seed_fold(nonce, time_, p0, p1, p2, p3);
-    unsigned long long off = state % n_total_chunks;
+    unsigned long long off = fast_mod(state, magic, shift, n_total_chunks);
     for (unsigned int i = 0; i < K; i++) {
         unsigned int lo = find_tensor(sprefix, T, off);
         unsigned long long local = off - sprefix[lo];
@@ -111,7 +134,7 @@ __global__ void pom_mine(
         h ^= __ldg(p + base + 2);
         h ^= __ldg(p + base + 3);
         state = mix64(h);
-        off = state % n_total_chunks;
+        off = fast_mod(state, magic, shift, n_total_chunks);
     }
     unsigned long long pv[4];
     pom_pow_fold(state, p0, p1, p2, p3, pv);
