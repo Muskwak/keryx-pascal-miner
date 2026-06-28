@@ -60,13 +60,25 @@ __device__ __forceinline__ bool pom_le_leq(const unsigned long long a[4],
 
 // Find the tensor index whose [prefix[t], prefix[t+1]) chunk range contains `off`, using the
 // shared-memory copy of `prefix`. Returns lo such that prefix[lo] <= off < prefix[lo+1].
+//
+// Predicated binary search: `selp` replaces branches, keeping the warp fully converged — no
+// serialized paths. On Pascal the if/else variant causes up to ~8× serialization with 500+
+// tensors (observed 100% GPU util / 10% mem util → compute-limited by divergence). Fully unrolled
+// 10 iterations covers T <= 1024; converged threads run NOP predications on the tail iterations.
 __device__ __forceinline__ unsigned int find_tensor(const unsigned long long* __restrict__ sprefix,
                                                     unsigned int T, unsigned long long off) {
-    unsigned int lo = 0, hi = T;
-    while (lo + 1 < hi) {
-        unsigned int mid = (lo + hi) >> 1;
-        if (sprefix[mid] <= off) lo = mid; else hi = mid;
-    }
+    unsigned int lo = 0, hi = T, mid, pred;
+    // Manually unrolled: each line = one binary-search step with no branch (setp + selp + selp).
+    mid = (lo + hi) >> 1; pred = (unsigned int)(sprefix[mid] <= off); lo = pred ? mid : lo; hi = pred ? hi : mid;
+    mid = (lo + hi) >> 1; pred = (unsigned int)(sprefix[mid] <= off); lo = pred ? mid : lo; hi = pred ? hi : mid;
+    mid = (lo + hi) >> 1; pred = (unsigned int)(sprefix[mid] <= off); lo = pred ? mid : lo; hi = pred ? hi : mid;
+    mid = (lo + hi) >> 1; pred = (unsigned int)(sprefix[mid] <= off); lo = pred ? mid : lo; hi = pred ? hi : mid;
+    mid = (lo + hi) >> 1; pred = (unsigned int)(sprefix[mid] <= off); lo = pred ? mid : lo; hi = pred ? hi : mid;
+    mid = (lo + hi) >> 1; pred = (unsigned int)(sprefix[mid] <= off); lo = pred ? mid : lo; hi = pred ? hi : mid;
+    mid = (lo + hi) >> 1; pred = (unsigned int)(sprefix[mid] <= off); lo = pred ? mid : lo; hi = pred ? hi : mid;
+    mid = (lo + hi) >> 1; pred = (unsigned int)(sprefix[mid] <= off); lo = pred ? mid : lo; hi = pred ? hi : mid;
+    mid = (lo + hi) >> 1; pred = (unsigned int)(sprefix[mid] <= off); lo = pred ? mid : lo; hi = pred ? hi : mid;
+    mid = (lo + hi) >> 1; pred = (unsigned int)(sprefix[mid] <= off); lo = pred ? mid : lo; hi = pred ? hi : mid;
     return lo;
 }
 

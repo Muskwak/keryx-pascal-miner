@@ -17,6 +17,8 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 
+use hex;
+
 fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
     #[cfg(target_family = "unix")]
     {
@@ -453,7 +455,7 @@ impl WeightIndex {
                 }
             }
         }
-        let mut writer = BufWriter::new(
+        let mut writer = BufWriter::with_capacity(1024 * 1024, // 1 MB buffer → 32K writes per syscall
             OpenOptions::new().read(true).write(true).create(true).truncate(true)
                 .open(&tree_path).map_err(candle_core::Error::wrap)?,
         );
@@ -480,6 +482,8 @@ impl WeightIndex {
         if n_chunks == 0 {
             return Err(candle_core::Error::Msg("PoM: model produced 0 chunks".into()));
         }
+        eprintln!("PoM: {n_chunks} leaf hashes written to disk ({:.1} GB)",
+            n_chunks as f64 * 32.0 / 1e9);
 
         // Independent read-only handle for on-demand chunk preads (the build handle is consumed).
         let gguf = File::open(path).map_err(candle_core::Error::wrap)?;
@@ -533,14 +537,17 @@ fn finalize_disk_tree(
     chunks: ChunkSource,
 ) -> candle_core::Result<WeightIndex> {
     let mut level_offsets: Vec<(u64, u64)> = vec![(0, n_chunks)];
+    let mut reader = BufReader::with_capacity(256 * 1024, // 256 KB buffer reduces syscalls
+        File::open(&tree_path).map_err(candle_core::Error::wrap)?);
     loop {
         let (loff, count) = *level_offsets.last().unwrap();
         if count == 1 {
             break;
         }
-        writer.flush().map_err(candle_core::Error::wrap)?;
         let next_off = loff + count * 32;
-        let mut reader = BufReader::new(File::open(&tree_path).map_err(candle_core::Error::wrap)?);
+        eprintln!("PoM: folding tree level {} ({:.1}M nodes)", level_offsets.len(),
+            count as f64 / 1_000_000.0);
+        writer.flush().map_err(candle_core::Error::wrap)?;
         reader.seek(SeekFrom::Start(loff)).map_err(candle_core::Error::wrap)?;
         let mut next_count: u64 = 0;
         let (mut left, mut right) = ([0u8; 32], [0u8; 32]);
@@ -564,6 +571,8 @@ fn finalize_disk_tree(
     let (root_off, _) = *level_offsets.last().unwrap();
     let mut r_t = [0u8; 32];
     read_exact_at(&tree_file, &mut r_t, root_off).map_err(candle_core::Error::wrap)?;
+    eprintln!("PoM: index build complete ({} chunks, {} levels, root={})",
+        n_chunks, level_offsets.len(), hex::encode(&r_t[..4]));
 
     Ok(WeightIndex { n_chunks, r_t, chunks, tree_file, tree_path, level_offsets })
 }
