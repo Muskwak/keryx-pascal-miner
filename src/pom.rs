@@ -14,7 +14,7 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use candle_core::quantized::gguf_file;
 use candle_core::Device;
 use std::fs::{File, OpenOptions};
-use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 
 use hex;
@@ -48,6 +48,10 @@ const SEED_SALT: u64 = 0x4B65727978500; // "KeryxP"
 /// K=256 — chosen compromise (~25 MH/s on a 3090, solid possession).
 pub const POM_WALK_STEPS: u32 = 256;
 pub const POM_OPENINGS: usize = 32;
+
+/// Merkle tree checkpoint interval: store every K-th level on disk (level 0 never stored —
+/// recomputed from the GGUF on demand; root always stored).
+const CHECKPOINT_INTERVAL: u32 = 6;
 
 // --- wire structs (field order == node's PomOpening/PomProof) ---
 
@@ -401,70 +405,198 @@ enum ChunkSource {
     Gguf { file: File, table: Vec<(u64, u64)> },
 }
 
+/// One checkpoint level stored on disk in the sparse Merkle tree file.
+struct StoredLevel {
+    level: u32,  // level index in the full tree (0 = leaves, root = total_levels - 1)
+    offset: u64, // byte offset within the checkpoint file
+    count: u64,  // node count at this level
+}
+
 /// Canonical weight index built once at startup from the resident model: the per-chunk
 /// blake3 leaves (for Merkle paths), the recomputed tier root `R_T` (sanity-checked against
 /// the consensus-pinned value), and a chunk reader. Canonical layout = name-sorted GGUF
 /// tensors, `floor(len/32)` 32 B chunks — identical to `pom-rt-builder` and the node.
 ///
-/// The Merkle tree lives on disk (pread); the raw chunks are read on demand from the GGUF
-/// (`ChunkSource::Gguf`), so the index holds no full host copy of the weights.
+/// The sparse checkpoint Merkle tree lives on disk: only every K-th level is stored
+/// (multiples of `CHECKPOINT_INTERVAL`, plus the root). Unstored intermediate levels are
+/// recomputed from the GGUF on demand via `merkle_path`. This cuts tree storage from ~2N
+/// nodes to ~N/(2^K - 1) nodes (~63× reduction for K=6).
 pub struct WeightIndex {
     pub n_chunks: u64,
     pub r_t: [u8; 32],
     /// Raw 32 B chunk reader: GGUF-backed in production, RAM-backed in synthetic tests.
     chunks: ChunkSource,
-    /// Disk-backed Merkle tree: all levels (level 0 = leaves … single-node root) concatenated in
-    /// one file, so the 70B tree (~84 GB) need not fit in RAM. `merkle_path` reads ~log N sibling
-    /// nodes via `pread`. Built once per PoM activation; deleted on drop.
+    /// Sparse checkpoint file: only stored levels are persisted (pread).
     tree_file: File,
+    #[allow(dead_code)]
     tree_path: PathBuf,
-    /// Per level: (byte offset of the level in `tree_file`, node count).
-    level_offsets: Vec<(u64, u64)>,
+    /// Stored checkpoint levels (multiples of CHECKPOINT_INTERVAL + root).
+    checkpoints: Vec<StoredLevel>,
+    /// Full tree depth: levels 0..total_levels-1 where total_levels-1 is the root.
+    total_levels: u32,
 }
 
 impl Drop for WeightIndex {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.tree_path);
+        // Tree is intentionally persistent across restarts (GGUF is immutable).
     }
+}
+
+/// Compute checkpoint levels from leaf count alone — purely arithmetic, no I/O.
+/// Returns (checkpoints, total_levels). Only stores multiples of CHECKPOINT_INTERVAL
+/// plus the root; level 0 is never stored.
+fn compute_checkpoint_offsets(n_chunks: u64) -> (Vec<StoredLevel>, u32) {
+    let mut checkpoints = Vec::new();
+    let mut count = n_chunks;
+    let mut off: u64 = 0;
+    let mut level: u32 = 0;
+
+    loop {
+        // Root (count=1) is always stored; other checkpoints at multiples of K, level > 0.
+        let is_checkpoint = (level > 0 && level.is_multiple_of(CHECKPOINT_INTERVAL)) || count == 1;
+        if is_checkpoint {
+            checkpoints.push(StoredLevel { level, offset: off, count });
+        }
+        if count == 1 {
+            break;
+        }
+        if is_checkpoint {
+            off += count * 32;
+        }
+        count = count.div_ceil(2);
+        level += 1;
+    }
+    // level is 0-indexed root index; total_levels = root index + 1
+    (checkpoints, level + 1)
+}
+
+/// Open an existing checkpoint tree file and reconstruct the WeightIndex.
+/// Detects legacy full-tree files (size mismatch) and returns an error so the caller can rebuild.
+fn open_existing_tree(tree_path: &std::path::Path, gguf_path: &str) -> candle_core::Result<WeightIndex> {
+    let mut file = File::open(gguf_path).map_err(candle_core::Error::wrap)?;
+    let content = gguf_file::Content::read(&mut file)?;
+    let mut names: Vec<String> = content.tensor_infos.keys().cloned().collect();
+    names.sort();
+
+    // Compute n_chunks (fast — only reads headers, no full tensor data).
+    let device = Device::Cpu;
+    let mut n_chunks: u64 = 0;
+    let mut table: Vec<(u64, u64)> = Vec::with_capacity(names.len());
+    for name in &names {
+        let file_off = content.tensor_data_offset + content.tensor_infos[name].offset;
+        let qt = content.tensor(&mut file, name, &device)?;
+        let bytes = qt.data()?;
+        let full = bytes.len() / 32;
+        if full > 0 {
+            table.push((n_chunks, file_off));
+        }
+        n_chunks += full as u64;
+    }
+    if n_chunks == 0 {
+        return Err(candle_core::Error::Msg("PoM: model produced 0 chunks".into()));
+    }
+    drop(file);
+
+    let (checkpoints, total_levels) = compute_checkpoint_offsets(n_chunks);
+    let expected_size = checkpoints.last().map(|cp| cp.offset + 32).unwrap_or(0);
+    let actual_size = std::fs::metadata(tree_path).map_err(candle_core::Error::wrap)?.len();
+
+    // Detect legacy full-tree file: it's ~2× the checkpoint size.
+    if actual_size > expected_size + expected_size {
+        log::info!(
+            "PoM: legacy full-tree pom-tree.bin detected ({} bytes → {} MB); will rebuild as sparse checkpoint (~{} MB for ~{}× savings)",
+            actual_size,
+            actual_size / 1_048_576,
+            expected_size / 1_048_576,
+            actual_size / expected_size.max(1),
+        );
+        return Err(candle_core::Error::Msg(format!(
+            "PoM: legacy full-tree detected ({} bytes) — rebuild with sparse checkpoints (expect ~{} bytes)",
+            actual_size, expected_size
+        )));
+    }
+    if actual_size != expected_size {
+        return Err(candle_core::Error::Msg(format!(
+            "PoM: cached tree size mismatch (expected {}, got {}) — delete pom-tree.bin to rebuild",
+            expected_size, actual_size
+        )));
+    }
+
+    let tree_file = OpenOptions::new().read(true).open(tree_path).map_err(candle_core::Error::wrap)?;
+
+    let root_cp = checkpoints.last().unwrap();
+    let mut r_t = [0u8; 32];
+    read_exact_at(&tree_file, &mut r_t, root_cp.offset).map_err(candle_core::Error::wrap)?;
+
+    let gguf = File::open(gguf_path).map_err(candle_core::Error::wrap)?;
+    Ok(WeightIndex {
+        n_chunks,
+        r_t,
+        chunks: ChunkSource::Gguf { file: gguf, table },
+        tree_file,
+        tree_path: tree_path.to_path_buf(),
+        checkpoints,
+        total_levels,
+    })
 }
 
 impl WeightIndex {
     /// Build from a GGUF on disk (CPU dtoh of each tensor). The bytes are candle's exact quantized
-    /// bytes — the same the miner serves in VRAM and the builder pinned in `R_T`. The Merkle tree
-    /// is streamed to a temp file next to the GGUF (disk, never tmpfs) so big tiers don't OOM.
+    /// bytes — the same the miner serves in VRAM and the builder pinned in `R_T`. The sparse
+    /// checkpoint Merkle tree is persisted to `pom-tree.bin` next to the GGUF: only every
+    /// K-th level is stored (~N/(2^K-1) nodes vs ~2N for a full tree). On subsequent restarts
+    /// the existing tree is reused (GGUF is immutable), avoiding a rebuild.
     pub fn build_from_gguf(path: &str) -> candle_core::Result<Self> {
+        let dir = std::path::Path::new(path).parent().unwrap_or_else(|| std::path::Path::new("."));
+        let tree_path = dir.join("pom-tree.bin");
+
+        // Clean up old PID-named files left by previous versions.
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                if name_str.starts_with("pom-tree-") && name_str.ends_with(".bin") && name_str != "pom-tree.bin" {
+                    log::info!("PoM: removing legacy tree file {}", entry.path().display());
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+
+        // Reuse existing checkpoint tree if valid.
+        if tree_path.exists() {
+            match open_existing_tree(&tree_path, path) {
+                Ok(idx) => {
+                    log::info!("PoM: reusing cached weight index — {} chunks", idx.n_chunks);
+                    return Ok(idx);
+                }
+                Err(e) => {
+                    log::warn!("PoM: cached tree invalid ({}), rebuilding…", e);
+                    let _ = std::fs::remove_file(&tree_path);
+                }
+            }
+        }
+
         let device = Device::Cpu;
         let mut file = File::open(path).map_err(candle_core::Error::wrap)?;
         let content = gguf_file::Content::read(&mut file)?;
         let mut names: Vec<String> = content.tensor_infos.keys().cloned().collect();
         names.sort(); // canonical order
 
-        // Tree temp file next to the GGUF (disk-backed; /tmp may be tmpfs = RAM).
-        let dir = std::path::Path::new(path).parent().unwrap_or_else(|| std::path::Path::new("."));
-        let tree_path = dir.join(format!("pom-tree-{}.bin", std::process::id()));
-        // Sweep ALL stale pom-tree-*.bin orphans, not just our own PID. Each is named by the PID
-        // that wrote it; a leftover means that process crashed/was killed before cleanup ran, and
-        // they can be GBs each (one per dead miner). The file we're about to create is fresh, so
-        // any existing pom-tree-*.bin is by definition stale. Best-effort: ignore errors.
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                let name = name.to_string_lossy();
-                if name.starts_with("pom-tree-") && name.ends_with(".bin") {
-                    let _ = std::fs::remove_file(entry.path());
-                }
-            }
-        }
-        let mut writer = BufWriter::with_capacity(1024 * 1024, // 1 MB buffer → 32K writes per syscall
+        // Phase 0: hash leaves from GGUF chunks → write first checkpoint level (level K) to disk.
+        // Process in batches of 2^K leaves, building a mini-tree per batch and writing only
+        // its root (the level-K node). Uses duplicate-last for the final partial batch.
+        let k = CHECKPOINT_INTERVAL;
+        let batch_size = 1u64 << k; // 64 for K=6
+
+        let mut writer = BufWriter::new(
             OpenOptions::new().read(true).write(true).create(true).truncate(true)
                 .open(&tree_path).map_err(candle_core::Error::wrap)?,
         );
 
-        // Level 0: hash chunks → leaves (to disk). The raw chunks are NOT retained in RAM; instead
-        // we record, per tensor, the canonical chunk index of its first chunk and that chunk's
-        // absolute byte offset in the GGUF, so `read_chunk` can `pread` any chunk on demand.
         let mut table: Vec<(u64, u64)> = Vec::with_capacity(names.len());
         let mut n_chunks: u64 = 0;
+        let mut batch_buf: Vec<[u8; 32]> = Vec::with_capacity(batch_size as usize);
+
         for name in &names {
             let file_off = content.tensor_data_offset + content.tensor_infos[name].offset;
             let qt = content.tensor(&mut file, name, &device)?;
@@ -475,23 +607,55 @@ impl WeightIndex {
             }
             for c in 0..full {
                 let chunk = &bytes[c * 32..c * 32 + 32];
-                writer.write_all(&blake(chunk)).map_err(candle_core::Error::wrap)?;
+                batch_buf.push(blake(chunk));
                 n_chunks += 1;
+                if batch_buf.len() == batch_size as usize {
+                    let level_k_node = merkle_root_mini(&batch_buf);
+                    writer.write_all(&level_k_node).map_err(candle_core::Error::wrap)?;
+                    batch_buf.clear();
+                }
             }
         }
+        // Final partial batch: merkle_root_mini handles duplicate-last naturally.
+        // Do NOT pad to batch_size — padding at level 0 changes intermediate hashes.
+        if !batch_buf.is_empty() {
+            let level_k_node = merkle_root_mini(&batch_buf);
+            writer.write_all(&level_k_node).map_err(candle_core::Error::wrap)?;
+        }
+
         if n_chunks == 0 {
             return Err(candle_core::Error::Msg("PoM: model produced 0 chunks".into()));
         }
-        eprintln!("PoM: {n_chunks} leaf hashes written to disk ({:.1} GB)",
-            n_chunks as f64 * 32.0 / 1e9);
+        eprintln!("PoM: {} chunks hashed → level-{} checkpoint nodes written ({:.1} GB reduced from {:.1} GB leaves)",
+            n_chunks, k, batch_size as f64 * 32.0 / 1e9, n_chunks as f64 * 32.0 / 1e9);
 
-        // Independent read-only handle for on-demand chunk preads (the build handle is consumed).
+        // Build higher checkpoint levels (2K, 3K, ..., root) from level-K nodes.
+        writer.flush().map_err(candle_core::Error::wrap)?;
+        drop(writer);
+        let (checkpoints, total_levels, r_t) = finalize_checkpoint_upper(&tree_path, n_chunks)?;
+
         let gguf = File::open(path).map_err(candle_core::Error::wrap)?;
-        finalize_disk_tree(writer, tree_path, n_chunks, ChunkSource::Gguf { file: gguf, table })
+        let tree_file = File::open(&tree_path).map_err(candle_core::Error::wrap)?;
+        eprintln!("PoM: index build complete ({} chunks, {} total levels, {} stored checkpoints, root={})",
+            n_chunks, total_levels, checkpoints.len(), hex::encode(&r_t[..4]));
+        Ok(WeightIndex {
+            n_chunks,
+            r_t,
+            chunks: ChunkSource::Gguf { file: gguf, table },
+            tree_file,
+            tree_path,
+            checkpoints,
+            total_levels,
+        })
     }
 
     /// 32 B chunk at canonical index `off` (panics if out of range — `off < n_chunks`).
     pub fn read_chunk(&self, off: u64) -> [u64; CHUNK_WORDS] {
+        chunk_to_words(&self.read_chunk_bytes(off))
+    }
+
+    /// Raw 32 B chunk bytes — used for leaf hashing in merkle_path.
+    fn read_chunk_bytes(&self, off: u64) -> [u8; 32] {
         let mut arr = [0u8; 32];
         match &self.chunks {
             #[cfg(test)]
@@ -500,26 +664,94 @@ impl WeightIndex {
                 arr.copy_from_slice(&data[base..base + 32]);
             }
             ChunkSource::Gguf { file, table } => {
-                // Tensor whose canonical range contains `off`: last entry with start <= off.
                 let j = table.partition_point(|&(start, _)| start <= off) - 1;
                 let (start, file_off) = table[j];
                 read_exact_at(file, &mut arr, file_off + (off - start) * 32).expect("PoM gguf chunk read");
             }
         }
-        chunk_to_words(&arr)
+        arr
     }
 
-    /// Inclusion path for chunk index `off`, reading each sibling from the on-disk tree (pread).
-    /// Byte-identical to the in-RAM duplicate-last walk: an out-of-range sibling is the node itself.
+    /// Find the stored checkpoint at `level`, panics if not found.
+    fn find_checkpoint(&self, level: u32) -> &StoredLevel {
+        self.checkpoints.iter().find(|cp| cp.level == level).expect("PoM: checkpoint not found")
+    }
+
+    /// Number of nodes at `level` in the full tree (0-indexed, level 0 = leaves).
+    fn count_at_level(&self, level: u32) -> u64 {
+        let mut count = self.n_chunks;
+        for _ in 0..level {
+            count = count.div_ceil(2);
+        }
+        count
+    }
+
+    /// Compute the hash of a subtree starting at `start_idx` (in the source level's index space)
+    /// spanning `count` source nodes. `src_level`: 0 = GGUF chunks, >0 = stored checkpoint level.
+    fn compute_subtree_hash(&self, start: u64, count: u64, src_level: u32) -> [u8; 32] {
+        if count == 0 {
+            return [0u8; 32];
+        }
+        if src_level == 0 {
+            // Source is GGUF: read chunks via pread, hash each, build mini-tree.
+            let last_valid = self.n_chunks.saturating_sub(1);
+            let leaves: Vec<[u8; 32]> = (0..count)
+                .map(|i| {
+                    let chunk_idx = (start + i).min(last_valid);
+                    blake(&self.read_chunk_bytes(chunk_idx))
+                })
+                .collect();
+            merkle_root_mini(&leaves)
+        } else {
+            // Source is a stored checkpoint: read nodes from file, build mini-tree.
+            let cp = self.find_checkpoint(src_level);
+            let last_valid = cp.count.saturating_sub(1);
+            let nodes: Vec<[u8; 32]> = (0..count)
+                .map(|i| {
+                    let idx = (start + i).min(last_valid);
+                    let mut buf = [0u8; 32];
+                    read_exact_at(&self.tree_file, &mut buf, cp.offset + idx * 32)
+                        .expect("PoM checkpoint read subtree");
+                    buf
+                })
+                .collect();
+            merkle_root_mini(&nodes)
+        }
+    }
+
+    /// Inclusion path for chunk index `off`, reading stored siblings from the checkpoint file
+    /// and computing unstored intermediate levels on-the-fly from the GGUF.
+    /// Byte-identical to the full-tree `merkle_path`: an out-of-range sibling is the node itself.
     pub fn merkle_path(&self, off: u64) -> Vec<[u8; 32]> {
-        let mut path = Vec::with_capacity(self.level_offsets.len());
-        let mut idx = off;
-        for &(loff, count) in &self.level_offsets[..self.level_offsets.len() - 1] {
-            let sib_idx = if idx & 1 == 0 { idx + 1 } else { idx - 1 };
-            let read_idx = if sib_idx < count { sib_idx } else { idx };
-            let mut node = [0u8; 32];
-            read_exact_at(&self.tree_file, &mut node, loff + read_idx * 32)
-                .expect("PoM tree read");
+        let total_levels = self.total_levels;
+        let mut path = Vec::with_capacity(total_levels as usize);
+        let mut idx: u64 = off;
+
+        for level in 0..total_levels {
+            if level == total_levels - 1 {
+                break; // root has no sibling
+            }
+
+            let sib_idx = idx ^ 1;
+            let is_stored = level > 0 && (level.is_multiple_of(CHECKPOINT_INTERVAL) || level == total_levels - 1);
+
+            let node = if is_stored {
+                // Read sibling directly from checkpoint file.
+                let cp = self.find_checkpoint(level);
+                let real_idx = if sib_idx < cp.count { sib_idx } else { idx };
+                let mut buf = [0u8; 32];
+                read_exact_at(&self.tree_file, &mut buf, cp.offset + real_idx * 32).expect("PoM checkpoint read");
+                buf
+            } else {
+                // Compute sibling from nearest source below.
+                // If sibling index is out of range, duplicate-last: use the node itself as sibling.
+                let node_count = self.count_at_level(level);
+                let real_sib_idx = if sib_idx < node_count { sib_idx } else { idx };
+                let src_level = (level / CHECKPOINT_INTERVAL) * CHECKPOINT_INTERVAL;
+                let span = 1u64 << (level - src_level);
+                self.compute_subtree_hash(real_sib_idx * span, span, src_level)
+            };
+
             path.push(node);
             idx >>= 1;
         }
@@ -527,54 +759,78 @@ impl WeightIndex {
     }
 }
 
-/// Reduce a tree whose level 0 (leaves) is already written to `writer`, streaming each higher level
-/// to the same file (duplicate-last on odd levels), and assemble the `WeightIndex`. Shared by
-/// `build_from_gguf` and tests so the disk reduction is exercised by the synthetic merkle_path tests.
-fn finalize_disk_tree(
-    mut writer: BufWriter<File>,
-    tree_path: PathBuf,
-    n_chunks: u64,
-    chunks: ChunkSource,
-) -> candle_core::Result<WeightIndex> {
-    let mut level_offsets: Vec<(u64, u64)> = vec![(0, n_chunks)];
-    let mut reader = BufReader::with_capacity(256 * 1024, // 256 KB buffer reduces syscalls
-        File::open(&tree_path).map_err(candle_core::Error::wrap)?);
-    loop {
-        let (loff, count) = *level_offsets.last().unwrap();
-        if count == 1 {
-            break;
-        }
-        let next_off = loff + count * 32;
-        eprintln!("PoM: folding tree level {} ({:.1}M nodes)", level_offsets.len(),
-            count as f64 / 1_000_000.0);
-        writer.flush().map_err(candle_core::Error::wrap)?;
-        reader.seek(SeekFrom::Start(loff)).map_err(candle_core::Error::wrap)?;
-        let mut next_count: u64 = 0;
-        let (mut left, mut right) = ([0u8; 32], [0u8; 32]);
-        let mut i: u64 = 0;
-        while i < count {
-            reader.read_exact(&mut left).map_err(candle_core::Error::wrap)?;
-            if i + 1 < count {
-                reader.read_exact(&mut right).map_err(candle_core::Error::wrap)?;
-            } else {
-                right = left; // duplicate-last
-            }
-            writer.write_all(&hash_pair(&left, &right)).map_err(candle_core::Error::wrap)?;
-            next_count += 1;
+/// Reduce a mini-tree of leaves to a single root with duplicate-last (matches full-tree behaviour).
+/// Used for building checkpoint nodes from small batches (2^K leaves or checkpoint nodes).
+#[inline]
+fn merkle_root_mini(leaves: &[[u8; 32]]) -> [u8; 32] {
+    debug_assert!(!leaves.is_empty());
+    let mut level = leaves.to_vec();
+    while level.len() > 1 {
+        let mut next = Vec::with_capacity(level.len().div_ceil(2));
+        let mut i = 0;
+        while i < level.len() {
+            let r = if i + 1 < level.len() { level[i + 1] } else { level[i] };
+            next.push(hash_pair(&level[i], &r));
             i += 2;
         }
-        level_offsets.push((next_off, next_count));
+        level = next;
     }
-    writer.flush().map_err(candle_core::Error::wrap)?;
-    let tree_file = writer.into_inner().map_err(|e| candle_core::Error::Msg(format!("PoM tree flush: {e}")))?;
+    level[0]
+}
 
-    let (root_off, _) = *level_offsets.last().unwrap();
+/// Build higher checkpoint levels from the already-written level-K nodes in the tree file.
+/// Reads level-K from the file, writes each higher checkpoint level (2K, 3K, ..., root),
+/// and returns the checkpoint layout + R_T.
+fn finalize_checkpoint_upper(
+    tree_path: &std::path::Path,
+    n_chunks: u64,
+) -> candle_core::Result<(Vec<StoredLevel>, u32, [u8; 32])> {
+    let (checkpoints, total_levels) = compute_checkpoint_offsets(n_chunks);
+    let k = CHECKPOINT_INTERVAL;
+    let batch_size = 1u64 << k; // 64 for K=6
+
+    let mut file_for_read = File::open(tree_path).map_err(candle_core::Error::wrap)?;
+    let mut prev_offset: u64 = checkpoints[0].offset;
+    let mut prev_count = checkpoints[0].count;
+
+    // Open for appending higher levels
+    let mut writer = OpenOptions::new().read(true).write(true).open(tree_path).map_err(candle_core::Error::wrap)?;
+    writer.seek(SeekFrom::End(0)).map_err(candle_core::Error::wrap)?;
+    let mut buf_writer = BufWriter::new(writer);
+
+    for cp in &checkpoints[1..] {
+        let mut batch: Vec<[u8; 32]> = Vec::with_capacity(batch_size as usize);
+        let mut read_idx: u64 = 0;
+
+        while read_idx < prev_count {
+            let remaining = prev_count - read_idx;
+            let take = batch_size.min(remaining);
+            batch.clear();
+            for i in 0..take {
+                let index = read_idx + i;
+                let mut node = [0u8; 32];
+                read_exact_at(&file_for_read, &mut node, prev_offset + index * 32).map_err(candle_core::Error::wrap)?;
+                batch.push(node);
+            }
+            // Do NOT pad partial batch — merkle_root_mini handles duplicate-last naturally.
+            // Padding at an intermediate level changes the tree structure vs the full tree.
+            let parent_node = merkle_root_mini(&batch);
+            buf_writer.write_all(&parent_node).map_err(candle_core::Error::wrap)?;
+            read_idx += take;
+        }
+
+        buf_writer.flush().map_err(candle_core::Error::wrap)?;
+        file_for_read = File::open(tree_path).map_err(candle_core::Error::wrap)?;
+        prev_offset = cp.offset;
+        prev_count = cp.count;
+    }
+
+    // Read R_T from the last checkpoint (root)
+    let root_cp = checkpoints.last().unwrap();
     let mut r_t = [0u8; 32];
-    read_exact_at(&tree_file, &mut r_t, root_off).map_err(candle_core::Error::wrap)?;
-    eprintln!("PoM: index build complete ({} chunks, {} levels, root={})",
-        n_chunks, level_offsets.len(), hex::encode(&r_t[..4]));
+    read_exact_at(&file_for_read, &mut r_t, root_cp.offset).map_err(candle_core::Error::wrap)?;
 
-    Ok(WeightIndex { n_chunks, r_t, chunks, tree_file, tree_path, level_offsets })
+    Ok((checkpoints, total_levels, r_t))
 }
 
 /// PoM possession activation DAA score — MUST match the node's `pom_activation`.
@@ -612,24 +868,56 @@ mod tests {
         c
     }
 
-    // Synthetic WeightIndex (no GGUF) — exercises the real read_chunk + O(log N) merkle_path.
+    // Synthetic WeightIndex (no GGUF) — exercises the real read_chunk + O(log N) merkle_path
+    // with the sparse checkpoint tree (same structure as production).
     fn synth_index(n: u64) -> WeightIndex {
         use std::sync::atomic::{AtomicU64, Ordering as O};
         static UNIQ: AtomicU64 = AtomicU64::new(0);
         let uid = UNIQ.fetch_add(1, O::Relaxed);
         let tree_path = std::env::temp_dir().join(format!("keryx-pom-synth-{}-{}.bin", std::process::id(), uid));
         let _ = std::fs::remove_file(&tree_path);
+
+        let k = CHECKPOINT_INTERVAL;
+        let batch_size = 1u64 << k; // 64 for K=6
+
+        // Write level-K nodes from batches of synth chunks.
         let mut writer = BufWriter::new(
-            OpenOptions::new().read(true).write(true).create(true).truncate(true)
-                .open(&tree_path).unwrap(),
+            OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&tree_path).unwrap(),
         );
         let mut data = Vec::new();
+        let mut batch: Vec<[u8; 32]> = Vec::with_capacity(batch_size as usize);
+
         for o in 0..n {
             let b = words_to_bytes(&synth_chunk(o));
-            writer.write_all(&blake(&b)).unwrap();
             data.extend_from_slice(&b);
+            batch.push(blake(&b));
+            if batch.len() == batch_size as usize {
+                let level_k_node = merkle_root_mini(&batch);
+                writer.write_all(&level_k_node).unwrap();
+                batch.clear();
+            }
         }
-        finalize_disk_tree(writer, tree_path, n, ChunkSource::Ram(data)).unwrap()
+        // Final partial batch: merkle_root_mini handles duplicate-last naturally.
+        if !batch.is_empty() {
+            writer.write_all(&merkle_root_mini(&batch)).unwrap();
+        }
+
+        writer.flush().unwrap();
+        drop(writer);
+
+        // Build higher checkpoints
+        let (checkpoints, total_levels, r_t) = finalize_checkpoint_upper(&tree_path, n).unwrap();
+
+        let tree_file = File::open(&tree_path).unwrap();
+        WeightIndex {
+            n_chunks: n,
+            r_t,
+            chunks: ChunkSource::Ram(data),
+            tree_file,
+            tree_path,
+            checkpoints,
+            total_levels,
+        }
     }
 
     /// GGUF-backed `read_chunk`: lay the canonical chunks across 3 "tensors" with header + inter-
@@ -661,16 +949,40 @@ mod tests {
         f.flush().unwrap();
         let file = File::open(&gguf_path).unwrap();
 
-        // Build the tree over the canonical synth chunks, with the GGUF chunk source.
+        // Build the sparse checkpoint tree over the canonical synth chunks, with the GGUF chunk source.
         let tree_path = std::env::temp_dir().join(format!("keryx-pom-fakegguf-tree-{uid}.bin"));
         let _ = std::fs::remove_file(&tree_path);
+
+        let k = CHECKPOINT_INTERVAL;
+        let batch_size = 1u64 << k;
         let mut writer = BufWriter::new(
             OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&tree_path).unwrap(),
         );
+        let mut batch: Vec<[u8; 32]> = Vec::with_capacity(batch_size as usize);
         for o in 0..n {
-            writer.write_all(&blake(&words_to_bytes(&synth_chunk(o)))).unwrap();
+            batch.push(blake(&words_to_bytes(&synth_chunk(o))));
+            if batch.len() == batch_size as usize {
+                writer.write_all(&merkle_root_mini(&batch)).unwrap();
+                batch.clear();
+            }
         }
-        let idx = finalize_disk_tree(writer, tree_path, n, ChunkSource::Gguf { file, table }).unwrap();
+        if !batch.is_empty() {
+            writer.write_all(&merkle_root_mini(&batch)).unwrap();
+        }
+        writer.flush().unwrap();
+        drop(writer);
+
+        let (checkpoints, total_levels, r_t) = finalize_checkpoint_upper(&tree_path, n).unwrap();
+        let tree_file = File::open(&tree_path).unwrap();
+        let idx = WeightIndex {
+            n_chunks: n,
+            r_t,
+            chunks: ChunkSource::Gguf { file, table },
+            tree_file,
+            tree_path,
+            checkpoints,
+            total_levels,
+        };
 
         // Every chunk read by pread matches the canonical chunk, across all segments + padding.
         for o in 0..n {
@@ -719,6 +1031,23 @@ mod tests {
         let idx = synth_index(n);
         let leaves: Vec<[u8; 32]> = (0..n).map(|o| blake(&words_to_bytes(&synth_chunk(o)))).collect();
         assert_eq!(idx.r_t, merkle_root(&leaves));
+    }
+
+    #[test]
+    fn merkle_path_matches_in_memory_proof() {
+        // The checkpoint merkle_path must be byte-identical to the in-memory merkle_proof.
+        let n = 4096;
+        let idx = synth_index(n);
+        let leaves: Vec<[u8; 32]> = (0..n).map(|o| blake(&words_to_bytes(&synth_chunk(o)))).collect();
+
+        for off in [0, 1, n / 2, n - 2, n - 1] {
+            let checkpoint_path = idx.merkle_path(off);
+            let memory_path = merkle_proof(&leaves, off as usize);
+            assert_eq!(checkpoint_path.len(), memory_path.len(), "path length mismatch at off={off}");
+            for (i, (cp, mp)) in checkpoint_path.iter().zip(memory_path.iter()).enumerate() {
+                assert_eq!(cp, mp, "path mismatch at off={off}, level={i}");
+            }
+        }
     }
 
     #[test]
