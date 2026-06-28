@@ -92,7 +92,7 @@ pub struct Opt {
     #[clap(short = 's', long = "keryxd-address", default_value = "127.0.0.1", help = "The IP of the keryxd instance")]
     pub keryxd_address: String,
 
-    #[clap(long = "devfund-percent", help = "The percentage of blocks to send to the devfund (minimum 2%)", default_value = "2", parse(try_from_str = parse_devfund_percent))]
+    #[clap(long = "devfund-percent", help = "The percentage of blocks to send to the devfund (0 to disable)", default_value = "0", parse(try_from_str = parse_devfund_percent))]
     pub devfund_percent: u16,
 
     #[clap(short, long, help = "Keryxd port [default: Mainnet = 22110, Testnet = 22211]")]
@@ -135,9 +135,9 @@ fn parse_devfund_percent(s: &str) -> Result<u16, &'static str> {
     if prefix >= 100 || postfix >= 100 {
         return Err(err);
     }
-    if prefix < 2 {
-        // Force at least 2 percent
-        return Ok(200u16);
+    if prefix == 0 {
+        // 0% disables the devfund entirely (main.rs only calls add_devfund when percent > 0).
+        return Ok(0u16);
     }
     // DevFund is out of 10_000
     Ok(prefix * 100 + postfix)
