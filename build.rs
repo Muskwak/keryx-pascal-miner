@@ -37,6 +37,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("cargo:rerun-if-changed=proto");
     println!("cargo:rerun-if-changed=src/keccakf1600_x86-64.s");
+    // Regenerate the per-arch PTX selector (pom_ptx.rs) whenever this script changes.
+    println!("cargo:rerun-if-changed=build.rs");
     tonic_build::configure()
         .build_server(false)
         // .type_attribute(".", "#[derive(Debug)]")
@@ -98,7 +100,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let major = arch.chars().next().unwrap();
             let minor = arch.chars().nth(1).unwrap();
             match_arms.push_str(&format!(
-                "        (({}, {}), _) => include_str!(concat!(env!(\"OUT_DIR\"), \"/pom_mine_sm{}.ptx\")),\n",
+                "        ({}, {}) => include_str!(concat!(env!(\"OUT_DIR\"), \"/pom_mine_sm{}.ptx\")),\n",
                 major, minor, arch
             ));
         }

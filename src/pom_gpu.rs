@@ -24,16 +24,13 @@ include!(concat!(env!("OUT_DIR"), "/pom_ptx.rs"));
 const CHUNK_BYTES: usize = 32;
 
 fn get_gpu_ptx_by_id(device_id: usize) -> &'static str {
-    // Query GPU compute capability by device ordinal; fallback to SM61
-    let cc = if let Ok(dev) = candle_core::cuda_backend::cudarc::driver::CudaDevice::new(device_id) {
-        if let Ok(props) = dev.get_device_properties() {
-            (props.computeCapabilityMajor as u32, props.computeCapabilityMinor as u32)
-        } else {
-            (6, 1)
-        }
-    } else {
-        (6, 1)
-    };
+    // Query GPU compute capability via the CUDA driver (cudarc CudaContext), then pick the
+    // matching embedded PTX. Falls back to SM61 (Pascal) if the query fails — PTX is
+    // forward-compatible, so the driver JITs it for the actual GPU regardless.
+    let cc = candle_core::cuda_backend::cudarc::driver::CudaContext::new(device_id)
+        .and_then(|ctx| ctx.compute_capability())
+        .map(|(maj, min)| (maj as u32, min as u32))
+        .unwrap_or((6, 1));
     get_pom_ptx(cc)
 }
 

@@ -27,8 +27,16 @@ mkdir -p "$OUT"
 
 # Build universal binary with all 7 GPU architectures embedded.
 # The binary auto-selects the optimal PTX kernel at runtime.
+# CUDA_COMPUTE_CAP: candle-kernels' bindgen_cuda otherwise calls nvidia-smi to detect the arch,
+# which fails in a GPU-less build container. Pin it to 61 — candle compiles to PTX, which the
+# driver JIT-compiles forward-compatibly for any GPU >= Pascal at runtime. Our pom_mine.cu is
+# already multi-arch (build.rs emits PTX for SM 61..90), so the universal selection is preserved.
+# --network=host: under WSL, Docker's default bridge NAT can intermittently fail DNS/egress
+# (archive.ubuntu.com timeouts). Using the host network stack directly is more reliable.
 docker run --rm \
+  --network=host \
   -v "$SRC:/src:rw" -w /src \
+  -e CUDA_COMPUTE_CAP=61 \
   -e CARGO_TARGET_DIR=/src/target-linux-universal \
   "$IMG" bash -c '
     set -e
