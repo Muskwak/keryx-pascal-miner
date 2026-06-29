@@ -613,16 +613,16 @@ impl WeightIndex {
                 batch_buf.push(blake(chunk));
                 n_chunks += 1;
                 if batch_buf.len() == batch_size as usize {
-                    let level_k_node = merkle_root_mini(&batch_buf);
+                    let level_k_node = fold_levels(&batch_buf, k);
                     writer.write_all(&level_k_node).map_err(candle_core::Error::wrap)?;
                     batch_buf.clear();
                 }
             }
         }
-        // Final partial batch: merkle_root_mini handles duplicate-last naturally.
+        // Final partial batch: fold_levels carries the partial tail the full K levels (duplicate-last).
         // Do NOT pad to batch_size — padding at level 0 changes intermediate hashes.
         if !batch_buf.is_empty() {
-            let level_k_node = merkle_root_mini(&batch_buf);
+            let level_k_node = fold_levels(&batch_buf, k);
             writer.write_all(&level_k_node).map_err(candle_core::Error::wrap)?;
         }
 
@@ -685,37 +685,38 @@ impl WeightIndex {
         count
     }
 
-    /// Compute the hash of a subtree starting at `start_idx` (in the source level's index space)
-    /// spanning `count` source nodes. `src_level`: 0 = GGUF chunks, >0 = stored checkpoint level.
-    fn compute_subtree_hash(&self, start: u64, count: u64, src_level: u32) -> [u8; 32] {
-        if count == 0 {
-            return [0u8; 32];
+    /// Compute the hash of the subtree whose root sits `log2(span)` levels above `src_level`, rooted
+    /// at source-level index `start` and covering `span` source nodes. `src_level`: 0 = GGUF chunks,
+    /// >0 = stored checkpoint level. `span` is always a power of two (= 2^(target_level - src_level)).
+    ///
+    /// Reads ONLY the in-range source nodes (a partial subtree exists only at the right edge) and
+    /// folds them EXACTLY `log2(span)` levels with per-level duplicate-last (`fold_levels`). Padding
+    /// the source by clamping the last valid index — the old approach — was WRONG: it injects extra
+    /// duplicated leaves that fold into a different node than the dense tree's `hash(x, x)` carry of a
+    /// lone INNER node, so reconstructed siblings (and thus proofs) mismatched at right-edge offsets.
+    fn compute_subtree_hash(&self, start: u64, span: u64, src_level: u32) -> [u8; 32] {
+        debug_assert!(span.is_power_of_two());
+        let rounds = span.trailing_zeros();
+        let source_count = if src_level == 0 { self.n_chunks } else { self.find_checkpoint(src_level).count };
+        if start >= source_count {
+            return [0u8; 32]; // guard: a real sibling subtree always starts in range
         }
-        if src_level == 0 {
-            // Source is GGUF: read chunks via pread, hash each, build mini-tree.
-            let last_valid = self.n_chunks.saturating_sub(1);
-            let leaves: Vec<[u8; 32]> = (0..count)
-                .map(|i| {
-                    let chunk_idx = (start + i).min(last_valid);
-                    blake(&self.read_chunk_bytes(chunk_idx))
-                })
-                .collect();
-            merkle_root_mini(&leaves)
+        let end = (start + span).min(source_count);
+        let nodes: Vec<[u8; 32]> = if src_level == 0 {
+            // Source is GGUF: read the in-range chunks via pread and hash each into a leaf.
+            (start..end).map(|i| blake(&self.read_chunk_bytes(i))).collect()
         } else {
-            // Source is a stored checkpoint: read nodes from file, build mini-tree.
+            // Source is a stored checkpoint: read the in-range nodes from file.
             let cp = self.find_checkpoint(src_level);
-            let last_valid = cp.count.saturating_sub(1);
-            let nodes: Vec<[u8; 32]> = (0..count)
+            (start..end)
                 .map(|i| {
-                    let idx = (start + i).min(last_valid);
                     let mut buf = [0u8; 32];
-                    read_exact_at(&self.tree_file, &mut buf, cp.offset + idx * 32)
-                        .expect("PoM checkpoint read subtree");
+                    read_exact_at(&self.tree_file, &mut buf, cp.offset + i * 32).expect("PoM checkpoint read subtree");
                     buf
                 })
-                .collect();
-            merkle_root_mini(&nodes)
-        }
+                .collect()
+        };
+        fold_levels(&nodes, rounds)
     }
 
     /// Inclusion path for chunk index `off`, reading stored siblings from the checkpoint file
@@ -758,13 +759,42 @@ impl WeightIndex {
     }
 }
 
-/// Reduce a mini-tree of leaves to a single root with duplicate-last (matches full-tree behaviour).
-/// Used for building checkpoint nodes from small batches (2^K leaves or checkpoint nodes).
+/// Reduce a slice of leaves straight to the single canonical root (duplicate-last each level).
+/// Applied to ALL leaves at once this is the dense reference root; it is NOT safe for batched
+/// sub-folds (it stops at one node, dropping the remaining `hash(x,x)` carries — the e1811a0 bug),
+/// so the build/path use `fold_levels` instead. Retained as the independent dense oracle in tests.
+#[cfg(test)]
 #[inline]
 fn merkle_root_mini(leaves: &[[u8; 32]]) -> [u8; 32] {
     debug_assert!(!leaves.is_empty());
     let mut level = leaves.to_vec();
     while level.len() > 1 {
+        let mut next = Vec::with_capacity(level.len().div_ceil(2));
+        let mut i = 0;
+        while i < level.len() {
+            let r = if i + 1 < level.len() { level[i + 1] } else { level[i] };
+            next.push(hash_pair(&level[i], &r));
+            i += 2;
+        }
+        level = next;
+    }
+    level[0]
+}
+
+/// Reduce `batch` by EXACTLY `rounds` canonical levels — duplicate-last each round, AND keep
+/// carrying a lone node via `hash(x, x)` once the batch collapses to one node before `rounds` is
+/// reached. For a full `2^rounds` batch this equals `merkle_root_mini`; for a short tail it carries
+/// the remaining levels, matching the dense `merkle_root` the node pins in `POM_TIERS`.
+///
+/// This is the fix for the sparse-build `R_T` bug: `merkle_root_mini` stops at `len == 1`, so a
+/// partial batch of `m ≤ 2^(rounds-1)` nodes lands fewer than `rounds` levels up and drops the
+/// remaining `hash(x, x)` carries — yielding a wrong checkpoint node (hence wrong `R_T`) for every
+/// non-power-of-two `N`. A batch fold must always land exactly `rounds` levels up.
+#[inline]
+fn fold_levels(batch: &[[u8; 32]], rounds: u32) -> [u8; 32] {
+    debug_assert!(!batch.is_empty());
+    let mut level = batch.to_vec();
+    for _ in 0..rounds {
         let mut next = Vec::with_capacity(level.len().div_ceil(2));
         let mut i = 0;
         while i < level.len() {
@@ -785,12 +815,10 @@ fn finalize_checkpoint_upper(
     n_chunks: u64,
 ) -> candle_core::Result<(Vec<StoredLevel>, u32, [u8; 32])> {
     let (checkpoints, total_levels) = compute_checkpoint_offsets(n_chunks);
-    let k = CHECKPOINT_INTERVAL;
-    let batch_size = 1u64 << k; // 64 for K=6
-
     let mut file_for_read = File::open(tree_path).map_err(candle_core::Error::wrap)?;
     let mut prev_offset: u64 = checkpoints[0].offset;
     let mut prev_count = checkpoints[0].count;
+    let mut prev_level = checkpoints[0].level;
 
     // Open for appending higher levels
     let mut writer = OpenOptions::new().read(true).write(true).open(tree_path).map_err(candle_core::Error::wrap)?;
@@ -798,12 +826,18 @@ fn finalize_checkpoint_upper(
     let mut buf_writer = BufWriter::new(writer);
 
     for cp in &checkpoints[1..] {
+        // Fold the previous stored level up to this checkpoint's level. A regular checkpoint sits
+        // CHECKPOINT_INTERVAL levels above the previous; the final (root) fold may span fewer. Batch
+        // the previous level by exactly 2^rounds and fold each batch EXACTLY `rounds` levels, so a
+        // partial tail carries via hash(x,x) like the dense tree. Node count per level is
+        // ceil(prev_count / 2^rounds) == cp.count (ceil(ceil(n/2)/2)…=ceil(n/2^rounds)), so offsets line up.
+        let rounds = cp.level - prev_level;
+        let batch_size = 1u64 << rounds;
         let mut batch: Vec<[u8; 32]> = Vec::with_capacity(batch_size as usize);
         let mut read_idx: u64 = 0;
 
         while read_idx < prev_count {
-            let remaining = prev_count - read_idx;
-            let take = batch_size.min(remaining);
+            let take = batch_size.min(prev_count - read_idx);
             batch.clear();
             for i in 0..take {
                 let index = read_idx + i;
@@ -811,9 +845,7 @@ fn finalize_checkpoint_upper(
                 read_exact_at(&file_for_read, &mut node, prev_offset + index * 32).map_err(candle_core::Error::wrap)?;
                 batch.push(node);
             }
-            // Do NOT pad partial batch — merkle_root_mini handles duplicate-last naturally.
-            // Padding at an intermediate level changes the tree structure vs the full tree.
-            let parent_node = merkle_root_mini(&batch);
+            let parent_node = fold_levels(&batch, rounds);
             buf_writer.write_all(&parent_node).map_err(candle_core::Error::wrap)?;
             read_idx += take;
         }
@@ -822,6 +854,7 @@ fn finalize_checkpoint_upper(
         file_for_read = File::open(tree_path).map_err(candle_core::Error::wrap)?;
         prev_offset = cp.offset;
         prev_count = cp.count;
+        prev_level = cp.level;
     }
 
     // Read R_T from the last checkpoint (root)
@@ -891,14 +924,14 @@ mod tests {
             data.extend_from_slice(&b);
             batch.push(blake(&b));
             if batch.len() == batch_size as usize {
-                let level_k_node = merkle_root_mini(&batch);
+                let level_k_node = fold_levels(&batch, k);
                 writer.write_all(&level_k_node).unwrap();
                 batch.clear();
             }
         }
-        // Final partial batch: merkle_root_mini handles duplicate-last naturally.
+        // Final partial batch: fold_levels carries the partial tail the full K levels (duplicate-last).
         if !batch.is_empty() {
-            writer.write_all(&merkle_root_mini(&batch)).unwrap();
+            writer.write_all(&fold_levels(&batch, k)).unwrap();
         }
 
         writer.flush().unwrap();
@@ -917,6 +950,42 @@ mod tests {
             checkpoints,
             total_levels,
         }
+    }
+
+    /// Regression for the sparse-checkpoint R_T bug (commit e1811a0): the checkpoint-built root MUST
+    /// equal the dense canonical root for every N — including non-power-of-two sizes whose short leaf
+    /// tail OR intermediate-fold tail used to drop the `hash(x, x)` carries (`merkle_root_mini` stopped
+    /// at one node). The dense reference is `merkle_root_mini` over ALL leaves at once (it reduces
+    /// straight to the true root, un-batched), which is exactly what `pom-rt-builder` pins in
+    /// `POM_TIERS`. Includes the report's known-broken sizes (2000, 4968, 12345, 100000).
+    #[test]
+    fn sparse_build_root_matches_dense_root() {
+        for n in [64u64, 65, 100, 1000, 2000, 4096, 4968, 12345, 65536, 100000, 131072] {
+            let leaves: Vec<[u8; 32]> = (0..n).map(|o| blake(&words_to_bytes(&synth_chunk(o)))).collect();
+            let dense = merkle_root_mini(&leaves);
+            let idx = synth_index(n);
+            assert_eq!(idx.r_t, dense, "sparse-built R_T != dense root for N={n}");
+            let _ = std::fs::remove_file(&idx.tree_path);
+        }
+    }
+
+    /// End-to-end check against a node-pinned root: build the sparse index from a real GGUF and
+    /// assert its R_T equals the value `pom-rt-builder` pinned in the node's `POM_TIERS`. This closes
+    /// the loop the synthetic test can't (real chunking: name-sorted tensors, floor(len/32), the exact
+    /// candle quantized bytes). `#[ignore]`d — needs the GGUF on disk; run with:
+    ///   KERYX_POM_TEST_GGUF=/path/model.gguf KERYX_POM_TEST_ROOT=<hex> \
+    ///     cargo test --release weight_index_matches_pinned_root -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn weight_index_matches_pinned_root() {
+        let path = std::env::var("KERYX_POM_TEST_GGUF").expect("set KERYX_POM_TEST_GGUF=/path/model.gguf");
+        let expected = std::env::var("KERYX_POM_TEST_ROOT").expect("set KERYX_POM_TEST_ROOT=<hex>").to_lowercase();
+        // Force a fresh build (don't reuse a possibly-stale cached tree from an older binary).
+        let dir = std::path::Path::new(&path).parent().unwrap();
+        let _ = std::fs::remove_file(dir.join("pom-tree.bin"));
+        let idx = WeightIndex::build_from_gguf(&path).unwrap();
+        let got: String = idx.r_t.iter().map(|b| format!("{:02x}", b)).collect();
+        assert_eq!(got, expected, "R_T mismatch vs pinned root for {path}");
     }
 
     /// GGUF-backed `read_chunk`: lay the canonical chunks across 3 "tensors" with header + inter-
@@ -961,12 +1030,12 @@ mod tests {
         for o in 0..n {
             batch.push(blake(&words_to_bytes(&synth_chunk(o))));
             if batch.len() == batch_size as usize {
-                writer.write_all(&merkle_root_mini(&batch)).unwrap();
+                writer.write_all(&fold_levels(&batch, k)).unwrap();
                 batch.clear();
             }
         }
         if !batch.is_empty() {
-            writer.write_all(&merkle_root_mini(&batch)).unwrap();
+            writer.write_all(&fold_levels(&batch, k)).unwrap();
         }
         writer.flush().unwrap();
         drop(writer);
@@ -1047,6 +1116,31 @@ mod tests {
                 assert_eq!(cp, mp, "path mismatch at off={off}, level={i}");
             }
         }
+    }
+
+    /// Regression for the sparse-checkpoint PATH bug: every offset's reconstructed `merkle_path`
+    /// must be byte-identical to the dense `merkle_proof` for non-power-of-two N. The old
+    /// `compute_subtree_hash` clamped the source to fill the span and mismatched the dense
+    /// duplicate-last carry at right-edge offsets. Exhaustive over the report's broken sizes; the
+    /// pre-existing test only used n=4096 (pow2) and missed it entirely.
+    #[test]
+    fn merkle_path_matches_dense_proof_nonpow2() {
+        for n in [65u64, 100, 1000, 2000, 4968, 12345] {
+            let idx = synth_index(n);
+            let leaves: Vec<[u8; 32]> = (0..n).map(|o| blake(&words_to_bytes(&synth_chunk(o)))).collect();
+            for off in 0..n {
+                assert_eq!(idx.merkle_path(off), merkle_proof(&leaves, off as usize), "path mismatch N={n} off={off}");
+            }
+            let _ = std::fs::remove_file(&idx.tree_path);
+        }
+        // Larger N: strided sweep + dense right edge (where the duplicate-last carry bites hardest).
+        let n = 100_000u64;
+        let idx = synth_index(n);
+        let leaves: Vec<[u8; 32]> = (0..n).map(|o| blake(&words_to_bytes(&synth_chunk(o)))).collect();
+        for off in (0..n).step_by(257).chain(n - 300..n) {
+            assert_eq!(idx.merkle_path(off), merkle_proof(&leaves, off as usize), "path mismatch N={n} off={off}");
+        }
+        let _ = std::fs::remove_file(&idx.tree_path);
     }
 
     #[test]
