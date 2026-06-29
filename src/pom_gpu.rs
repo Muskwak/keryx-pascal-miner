@@ -18,8 +18,24 @@ use candle_core::cuda_backend::cudarc::driver::{CudaSlice, CudaStream, LaunchCon
 use candle_core::quantized::{gguf_file, QTensor};
 use candle_core::{CudaDevice, Device};
 
-const PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/pom_mine.ptx"));
+// Include generated PTX selector module
+include!(concat!(env!("OUT_DIR"), "/pom_ptx.rs"));
+
 const CHUNK_BYTES: usize = 32;
+
+fn get_gpu_ptx_by_id(device_id: usize) -> &'static str {
+    // Query GPU compute capability by device ordinal; fallback to SM61
+    let cc = if let Ok(dev) = candle_core::cuda_backend::cudarc::driver::CudaDevice::new(device_id) {
+        if let Ok(props) = dev.get_device_properties() {
+            (props.computeCapabilityMajor as u32, props.computeCapabilityMinor as u32)
+        } else {
+            (6, 1)
+        }
+    } else {
+        (6, 1)
+    };
+    get_pom_ptx(cc)
+}
 
 fn words4(b: &[u8; 32]) -> [u64; 4] {
     let mut w = [0u64; 4];
@@ -150,7 +166,8 @@ impl PomGpuMiner {
         let bases_dev = stream.clone_htod(&bases).map_err(candle_core::Error::wrap)?;
         let prefix_dev = stream.clone_htod(&prefix).map_err(candle_core::Error::wrap)?;
         // Warm the module cache so mine() never compiles on the hot path.
-        let _ = cuda.get_or_load_custom_func("pom_mine", "pom_mine_mod", PTX)?;
+        let ptx = get_gpu_ptx_by_id(device_id);
+        let _ = cuda.get_or_load_custom_func("pom_mine", "pom_mine_mod", ptx)?;
 
         Ok(Self { cuda, stream, bases_dev, prefix_dev, t_count: bases.len() as u32, n_total_chunks, _tensors: tensors, _shared: Vec::new() })
     }
@@ -215,7 +232,9 @@ impl PomGpuMiner {
 
         let bases_dev = stream.clone_htod(&bases).map_err(candle_core::Error::wrap)?;
         let prefix_dev = stream.clone_htod(&prefix).map_err(candle_core::Error::wrap)?;
-        let _ = cuda.get_or_load_custom_func("pom_mine", "pom_mine_mod", PTX)?;
+        // For load_shared, use generic SM61 PTX that works on all GPUs (JIT compiled by driver for specific GPU)
+        let ptx = get_pom_ptx((6, 1));
+        let _ = cuda.get_or_load_custom_func("pom_mine", "pom_mine_mod", ptx)?;
 
         Ok(Self { cuda, stream, bases_dev, prefix_dev, t_count: bases.len() as u32, n_total_chunks, _tensors: raw, _shared: kept_shared })
     }
@@ -248,7 +267,9 @@ impl PomGpuMiner {
         let smem_bytes = ((self.t_count as usize + 1) * std::mem::size_of::<u32>()) as u32;
         let cfg = LaunchConfig { grid_dim: (grid, 1, 1), block_dim: (128, 1, 1), shared_mem_bytes: smem_bytes };
 
-        let func = self.cuda.get_or_load_custom_func("pom_mine", "pom_mine_mod", PTX)?; // cached
+        // Retrieve cached PTX function (loaded during load() or load_shared())
+        let ptx = get_pom_ptx((6, 1)); // any compatible PTX works since it's cached by function name
+        let func = self.cuda.get_or_load_custom_func("pom_mine", "pom_mine_mod", ptx)?; // cached
         let mut b = func.builder();
         b.arg(&self.bases_dev).arg(&self.prefix_dev).arg(&self.t_count).arg(&self.n_total_chunks).arg(&k)
             .arg(&magic).arg(&shift)

@@ -44,15 +44,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &["proto/rpc.proto", "proto/p2p.proto", "proto/messages.proto"],
             &["proto"],
         )?;
-    // PoM mining kernel → PTX (loaded at runtime into candle's CUDA context). nvcc 12.2 (PATH).
+    // PoM mining kernel → PTX (loaded at runtime into candle's CUDA context). Compile for all major NVIDIA architectures.
     println!("cargo:rerun-if-changed=cuda/pom_mine.cu");
     {
         let out_dir = env::var("OUT_DIR").unwrap();
-        // Resolve nvcc explicitly: NVCC env var wins; else CUDA_PATH/bin/nvcc(.exe); else PATH.
-        // This matters when multiple CUDA toolkits coexist (e.g. v11.8 + v12.8) — without it the
-        // bare "nvcc" resolves via PATH and may pick an older toolkit whose headers reject a
-        // newer MSVC (fatal error C1189), producing a confusing build failure. CUDA_PATH is the
-        // standard env var the rest of the CUDA ecosystem honors.
         let nvcc = env::var("NVCC").ok().unwrap_or_else(|| {
             if let Some(base) = env::var_os("CUDA_PATH") {
                 let mut p = std::path::PathBuf::from(base);
@@ -62,37 +57,61 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             "nvcc".to_string()
         });
-        // Default to sm_61 (Tesla P40 / Pascal GP102) — this fork is the Pascal-tuned miner.
-        // Override with SM_ARCH for other cards (e.g. sm_75 for Turing, sm_86 for Ampere).
-        let sm = env::var("SM_ARCH").unwrap_or_else(|_| "61".to_string());
-        let ptx = format!("{out_dir}/pom_mine.ptx");
 
-        // On Windows nvcc needs MSVC's cl.exe as host compiler. Normally it's on PATH via
-        // build_release.bat's vcvars64; if not (e.g. building from a bare shell), honor an
-        // explicit MSVC_CLBIN env var or auto-discover the newest VS 2022 toolchain so the build
-        // is robust regardless of how it's launched.
-        // NOTE: -Xptxas=-v (verbose ptxas, for register/occupancy tuning) is intentionally
-        // omitted — it crashes nvcc on deprecated targets (sm_61/75) with CUDA 12.8 + MSVC,
-        // failing the build. The register/occupancy tuning is already done (21 regs, 100%
-        // occupancy on sm_61); re-enable locally with SM_ARCH=89 if you need to re-measure.
-        let mut cmd = std::process::Command::new(&nvcc);
-        cmd.args(["-ptx", "-O3", "--use_fast_math",
-                  &format!("-arch=sm_{sm}"), "cuda/pom_mine.cu", "-o", &ptx]);
-        if let Ok(c) = env::var("MSVC_CLBIN").or_else(|_| discover_clbin()) {
-            println!("cargo:warning=nvcc host compiler: {c}");
-            cmd.arg("-ccbin").arg(c);
+        // Compile PTX for all major NVIDIA compute capabilities: Pascal (61), Volta (70), Turing (75), Ampere (80/86), Ada (89), Hopper (90)
+        let archs = [("61", "PomMinerSm61"), ("70", "PomMinerSm70"), ("75", "PomMinerSm75"),
+                     ("80", "PomMinerSm80"), ("86", "PomMinerSm86"), ("89", "PomMinerSm89"),
+                     ("90", "PomMinerSm90")];
+
+        let mut ptx_includes = Vec::new();
+
+        for (arch, _name) in &archs {
+            let ptx_path = format!("{out_dir}/pom_mine_sm{arch}.ptx");
+            let mut cmd = std::process::Command::new(&nvcc);
+            cmd.args(["-ptx", "-O3", "--use_fast_math",
+                      &format!("-arch=sm_{arch}"), "cuda/pom_mine.cu", "-o", &ptx_path]);
+            if let Ok(c) = env::var("MSVC_CLBIN").or_else(|_| discover_clbin()) {
+                cmd.arg("-ccbin").arg(&c);
+            }
+
+            cmd.stdout(std::process::Stdio::piped());
+            cmd.stderr(std::process::Stdio::piped());
+            let out = cmd.output().unwrap_or_else(|e| panic!("nvcc ({nvcc}) failed to run: {e}"));
+            if !out.status.success() {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                panic!("nvcc failed to compile cuda/pom_mine.cu (sm_{arch}):\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}");
+            }
+
+            // Generate include statement for this architecture
+            ptx_includes.push(format!(
+                "    (({major}, {minor}), include_str!(concat!(env!(\"OUT_DIR\"), \"/pom_mine_sm{arch}.ptx\"))),",
+                major = arch.chars().next().unwrap(),
+                minor = arch.chars().nth(1).unwrap(),
+                arch = arch
+            ));
         }
 
-        // -Xptxas=-v surfaces register usage + occupancy so the threads/block + maxrregcount
-        // tuning in pom_gpu.rs can be measured instead of guessed.
-        cmd.stdout(std::process::Stdio::piped());
-        cmd.stderr(std::process::Stdio::piped());
-        let out = cmd.output().unwrap_or_else(|e| panic!("nvcc ({nvcc}) failed to run: {e}"));
-        if !out.status.success() {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            panic!("nvcc failed to compile cuda/pom_mine.cu (sm_{sm}):\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}");
+        // Generate a lookup function module with proper match arm syntax
+        let mut match_arms = String::new();
+        for (arch, _name) in &archs {
+            let major = arch.chars().next().unwrap();
+            let minor = arch.chars().nth(1).unwrap();
+            match_arms.push_str(&format!(
+                "        (({}, {}), _) => include_str!(concat!(env!(\"OUT_DIR\"), \"/pom_mine_sm{}.ptx\")),\n",
+                major, minor, arch
+            ));
         }
+
+        let lookup_code = format!(
+            "/// Auto-selected PTX based on GPU compute capability\npub fn get_pom_ptx(cc: (u32, u32)) -> &'static str {{\n    match cc {{\n{}        _ => include_str!(concat!(env!(\"OUT_DIR\"), \"/pom_mine_sm61.ptx\")),\n    }}\n}}",
+            match_arms
+        );
+
+        std::fs::write(
+            format!("{out_dir}/pom_ptx.rs"),
+            lookup_code,
+        ).unwrap_or_else(|e| panic!("Failed to write pom_ptx.rs: {e}"));
     }
 
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
