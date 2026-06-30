@@ -198,11 +198,30 @@ pub fn install(device_id: u32, m: PomGpuMiner) {
     }
 }
 
-/// Drop the GPU miner, releasing its hold on the mining model's VRAM (shared Arcs + gather) so
-/// the inference engine can load another model. Mining is paused during inference anyway.
-pub fn uninstall() {
+/// Removes only `device_id`'s entry from a `device -> miner` map, leaving every other device's
+/// entry untouched. Pulled out as a tiny generic helper (over the map's value type) purely so
+/// this scoping behavior is unit-testable without a real, CUDA-backed `PomGpuMiner` — production
+/// always calls it through `uninstall` against `HashMap<u32, Arc<PomGpuMiner>>`.
+fn remove_device_entry<T>(map: &mut HashMap<u32, T>, device_id: u32) {
+    map.remove(&device_id);
+}
+
+/// Drop the GPU miner for `device_id` only, releasing its hold on that device's mining-model VRAM
+/// (shared Arcs + gather) so the inference engine can load another model there. Mining on that
+/// device is paused during inference anyway.
+///
+/// Scoped to a single device on purpose: only the device colocated with inference (CUDA device 0
+/// — see the `Device::new_cuda(0)` call in `slm::load_and_run_inference`) ever shares VRAM with
+/// the inference engine via `load_shared`'s zero-dup path, or otherwise needs to make room for an
+/// inference model swap. Other devices in a multi-GPU rig run fully standalone `PomGpuMiner`s
+/// (`PomGpuMiner::load`) that never touch the inference engine's VRAM. A previous version of this
+/// function called `g.clear()`, dropping every device's resident miner on every inference model
+/// swap — needlessly forcing GPU1+ rigs to fully reload their GGUF from disk and rebuild the
+/// gather index (`ensure_installed_inner`'s own doc comment calls this reload "Heavy") even though
+/// nothing about them changed.
+pub fn uninstall(device_id: u32) {
     if let Ok(mut g) = miners().lock() {
-        g.clear();
+        remove_device_entry(&mut g, device_id);
     }
 }
 
@@ -334,5 +353,43 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
             log::error!("PoM[gpu{}]: device miner build failed: {}", device_id, e);
             false
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // These exercise `remove_device_entry` directly with a dummy value type, rather than going
+    // through `install`/`uninstall`, because `PomGpuMiner` can only be constructed via `load`/
+    // `load_shared`, both of which require real CUDA hardware (`Device::new_cuda`) unavailable in
+    // CI/unit-test environments. `remove_device_entry` holds the entire scoping logic that
+    // `uninstall` delegates to, so this still covers the behavior that matters: only the targeted
+    // device's entry is removed, every other device's entry survives untouched.
+
+    #[test]
+    fn remove_device_entry_only_clears_target_device() {
+        let mut map: HashMap<u32, &str> = HashMap::new();
+        map.insert(0, "gpu0-miner");
+        map.insert(1, "gpu1-miner");
+        map.insert(2, "gpu2-miner");
+
+        remove_device_entry(&mut map, 0);
+
+        assert!(!map.contains_key(&0));
+        assert_eq!(map.get(&1), Some(&"gpu1-miner"));
+        assert_eq!(map.get(&2), Some(&"gpu2-miner"));
+        assert_eq!(map.len(), 2);
+    }
+
+    #[test]
+    fn remove_device_entry_on_missing_device_is_a_no_op() {
+        let mut map: HashMap<u32, &str> = HashMap::new();
+        map.insert(1, "gpu1-miner");
+
+        remove_device_entry(&mut map, 0);
+
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.get(&1), Some(&"gpu1-miner"));
     }
 }

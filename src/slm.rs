@@ -1000,8 +1000,10 @@ pub fn load_and_run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usi
                 log::info!("SlmEngine: evicting '{}' to load '{}'", old.name, spec.name);
             }
             // Inference has priority over PoW: release the GPU miner's hold on the resident mining
-            // weights so this model fits. Mining rebuilds (reloads its model) when it next runs.
-            crate::pom_gpu::uninstall();
+            // weights on this device only, so this model fits. Mining rebuilds (reloads its model)
+            // when it next runs on this device. `0` matches the CUDA device inference always loads
+            // onto below (`Device::new_cuda(0)`); other devices' resident miners are left alone.
+            crate::pom_gpu::uninstall(0);
             *guard = None;
             let device = match Device::new_cuda(0) {
                 Ok(d) => { log::info!("SlmEngine: CUDA device 0 active"); d }
