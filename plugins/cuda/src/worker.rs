@@ -20,6 +20,7 @@ static PTX_89: &str = include_str!("../resources/keryx-cuda-sm89.ptx");
 static PTX_86: &str = include_str!("../resources/keryx-cuda-sm86.ptx");
 static PTX_80: &str = include_str!("../resources/keryx-cuda-sm80.ptx");
 static PTX_75: &str = include_str!("../resources/keryx-cuda-sm75.ptx");
+static PTX_70: &str = include_str!("../resources/keryx-cuda-sm70.ptx");
 static PTX_61: &str = include_str!("../resources/keryx-cuda-sm61.ptx");
 // sm_30 (Kepler) and sm_20 (Fermi) dropped: CUDA 12+ no longer compiles for
 // these architectures, and they predate practical GPU mining anyway.
@@ -263,6 +264,18 @@ impl<'gpu> CudaGPUWorker<'gpu> {
                 error!("Error loading PTX. Make sure you have the updated driver for you devices");
                 e
             })?);
+        } else if major == 7 {
+            // sm_70/sm_72 (Volta)
+            _module = Arc::new(match load_ptx(PTX_70, "sm_70") {
+                Ok(m) => {
+                    info!("GPU #{} using optimised sm_70 PTX", device_id);
+                    m
+                }
+                Err(e) => {
+                    info!("GPU #{} falling back to sm_61 PTX (update driver for native sm_70)", device_id);
+                    load_ptx(PTX_61, "sm_61 (fallback)").map_err(|_| e)?
+                }
+            });
         } else if major > 6 || (major == 6 && minor >= 1) {
             // sm_61 (GTX 10 / Pascal)
             _module = Arc::new(Module::from_ptx(PTX_61, &[ModuleJitOption::OptLevel(OptLevel::O4)]).map_err(|e| {
