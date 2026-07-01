@@ -20,12 +20,12 @@
 #include <cassert>
 #include <cstring>
 #include "moe_utils.cuh"
-// Guard the WMMA namespace import for sm_61 (Pascal): nvcuda::wmma only exists on sm_70+.
-// Kernel bodies that use wmma symbols are already `#if __CUDA_ARCH__ >= 800`-guarded below,
-// so nothing references the namespace on Pascal. See moe_wmma.cu for the same guard.
-#if __CUDA_ARCH__ >= 800
+
+// Tensor-core (WMMA) GGUF MoE prefill GEMM. Requires sm_70+ device code; compile the
+// host pass everywhere so the extern "C" launcher stays linkable, but emit no device
+// code below sm_70 (Pascal/sm_6x has no nvcuda::wmma).
+#if !defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 700)
 using namespace nvcuda::wmma;
-#endif
 
 // Constants from original kernel
 constexpr int WMMA_M = 16;
@@ -430,3 +430,4 @@ extern "C" void moe_gemm_gguf_prefill(
     cudaFreeAsync(expert_counts, stream);
     cudaFreeAsync(expert_offsets, stream);
 }
+#endif // WMMA device code requires sm_70+

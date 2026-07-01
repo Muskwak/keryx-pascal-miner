@@ -128,7 +128,6 @@ fn filter_plugins(dirname: &str) -> Vec<String> {
 ///
 /// Power thresholds empirically derived: Xid 32 observed at ≤300W on RTX 3090 with 32B GGUF.
 fn check_gpu_power_limit(needs_high: bool, needs_very_high: bool) {
-    let ordinal = mining_gpu_ordinal();
     let output = std::process::Command::new("nvidia-smi")
         .args([
             "--query-gpu=power.limit,power.max_limit,memory.total",
@@ -136,23 +135,22 @@ fn check_gpu_power_limit(needs_high: bool, needs_very_high: bool) {
         ])
         .output();
 
-    // nvidia-smi prints one line per GPU; index the mining GPU's line (was hard-coded GPU 0).
-    // KERYX_CUDA_DEVICE selects which line; defaults to 0 for the single-GPU case.
+    // nvidia-smi prints one line per GPU; the power + VRAM check applies to GPU 0
+    // (the device the miner mines/serves on).
     let (current_w, vram_mb) = match output {
         Ok(o) if o.status.success() => {
             let s = String::from_utf8_lossy(&o.stdout);
             let mut cur = 0u32;
             let mut vram = 0u64;
-            for (i, line) in s.trim().lines().enumerate() {
-                if i != ordinal {
-                    continue; // skip non-mining GPUs
-                }
+            for (i, line) in s.trim().lines().take(1).enumerate() {
                 let mut parts = line.split(',');
                 let line_cur: f32 = parts.next().unwrap_or("0").trim().parse().unwrap_or(0.0);
                 let _max: f32 = parts.next().unwrap_or("0").trim().parse().unwrap_or(0.0);
                 let line_vram: u64 = parts.next().unwrap_or("0").trim().parse().unwrap_or(0);
-                cur = line_cur as u32;
-                vram = line_vram;
+                if i == 0 {
+                    cur = line_cur as u32;
+                }
+                vram += line_vram;
             }
             (cur, vram)
         }
@@ -185,21 +183,9 @@ fn check_gpu_power_limit(needs_high: bool, needs_very_high: bool) {
     }
 }
 
-/// Total VRAM (MB) of the mining GPU via nvidia-smi, or None when nvidia-smi is unavailable or
-/// unparseable (e.g. AMD-only machines). The mining GPU is the one the miner actually mines/serves
-/// on. The ordinal defaults to 0 (the upstream single-GPU assumption), but on a multi-GPU rig
-/// where the smaller card is ordinal 0 (e.g. GTX 1070=0, Tesla P40=1), set KERYX_CUDA_DEVICE=N
-/// to point this check at the real mining GPU. nvidia-smi and CUDA device ordinals match, so the
-/// same N works for both this query and the plugin's --cuda-device flag.
-fn mining_gpu_ordinal() -> usize {
-    std::env::var("KERYX_CUDA_DEVICE")
-        .ok()
-        .and_then(|s| s.trim().parse::<usize>().ok())
-        .unwrap_or(0)
-}
-
+/// GPU 0 total VRAM (MB) via nvidia-smi, or None when nvidia-smi is unavailable or
+/// unparseable (e.g. AMD-only machines). GPU 0 is the device the miner mines/serves on.
 fn query_vram_mb() -> Option<u64> {
-    let ordinal = mining_gpu_ordinal();
     let output = std::process::Command::new("nvidia-smi")
         .args(["--query-gpu=memory.total", "--format=csv,noheader,nounits"])
         .output()
@@ -209,7 +195,7 @@ fn query_vram_mb() -> Option<u64> {
     }
     String::from_utf8_lossy(&output.stdout)
         .lines()
-        .nth(ordinal) // index the mining GPU's line (was hard-coded .next() = GPU 0)
+        .next()
         .and_then(|l| l.trim().parse::<u64>().ok())
 }
 
@@ -232,7 +218,7 @@ fn filter_specs_by_vram(
                 true
             } else {
                 log::warn!(
-                    "✗  '{}' needs ≥{} MB VRAM but only {} MB on mining GPU — model NOT announced (ai:cap) and not downloaded.",
+                    "✗  '{}' needs ≥{} MB VRAM but only {} MB on GPU 0 — model NOT announced (ai:cap) and not downloaded.",
                     spec.name,
                     spec.min_vram_mb,
                     gpu0_mb,
@@ -331,36 +317,6 @@ async fn main() -> Result<(), Error> {
     let mut opt: Opt = Opt::from_arg_matches(&matches)?;
     opt.process()?;
     env_logger::builder().filter_level(opt.log_level()).parse_default_env().init();
-
-    // Clean shutdown: respond to SIGINT (Ctrl-C) and SIGTERM — the signals HiveOS / mmpOS / SMOS /
-    // systemd send to STOP a miner. The GPU worker threads sit in long, uninterruptible CUDA calls
-    // and can't be stopped cooperatively, so we exit the process directly and let the OS reclaim the
-    // CUDA context. (Without this the miner ignored SIGINT/SIGTERM and only died on SIGKILL.)
-    tokio::spawn(async {
-        #[cfg(unix)]
-        {
-            use tokio::signal::unix::{signal, SignalKind};
-            match signal(SignalKind::terminate()) {
-                Ok(mut term) => {
-                    tokio::select! {
-                        _ = tokio::signal::ctrl_c() => {}
-                        _ = term.recv() => {}
-                    }
-                }
-                Err(e) => {
-                    log::error!("SIGTERM handler install failed ({e}) — falling back to Ctrl-C only.");
-                    let _ = tokio::signal::ctrl_c().await;
-                }
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = tokio::signal::ctrl_c().await;
-        }
-        log::warn!("Shutdown signal received — stopping keryx-miner.");
-        std::process::exit(0);
-    });
-
     info!("=================================================================================");
     info!("                 Keryx-Miner GPU {}", env!("CARGO_PKG_VERSION"));
     info!(" Mining for: {}", opt.mining_address.as_deref().unwrap_or("(recovery mode)"));
@@ -479,26 +435,15 @@ async fn main() -> Result<(), Error> {
         info!("default mode: mines Dolphin-8B under PoM.");
         keryx_miner::models::Tier::Default
     };
-    // OPoI v2 hardfork: the model lineup is DAA-gated (mirrors the node's
-    // opoi_v2_activation). Stage BOTH lineups for this tier — each filtered by what
-    // this hardware can serve (layer-A capability gate) — so the chain crossing
-    // hot-swaps without a restart:
-    //   - legacy (daa < H) is prefetched now and mined immediately;
-    //   - uncensored (daa >= H) is prefetched in the background and swapped in at H.
-    // `specs_v1` is the CURRENT (legacy, daa < H) lineup the miner announces and serves until the
-    // chain crosses H — `specs_for(0, ..)` so a fresh chain declares the legacy models.
-    // --no-legacy zeroes it (the chain is at/after H, or imminently crossing, so the legacy
-    // set is dead weight): no legacy prefetch, no legacy capability announcement.
-    // filter_specs_by_vram returns &'static [&'static ModelSpec] (the fast path returns the
-    // input slice; the slow path leaks a Vec<&ModelSpec>). With --no-legacy we use the empty
-    // slice so no legacy models are prefetched or announced.
-    let specs_v1: &'static [&'static keryx_miner::models::ModelSpec] = if opt.no_legacy {
-        &[]
-    } else {
-        filter_specs_by_vram(keryx_miner::models::specs_for(0, tier))
-    };
+    // Stage the FINAL lineup (post-H2) directly — `specs_for(VERY_LIGHT_ACTIVATION_DAA, ..)` always
+    // returns the latest models for the tier. The legacy lineup is dead (OPoI-v2 is in the past),
+    // and we deliberately do NOT also download the pre-H2 model for a tier whose model changes at
+    // H2: the old `--very-high` 70B Q4_K_M is served by nobody (48 GB-only), so a 5090 miner just
+    // pulls the new Q2_K_L straight away instead of paying two ~27 GB downloads + a hot-swap. A
+    // tier whose post-H2 model isn't consensus-valid yet (very-light, very-high) simply produces no
+    // block until H2 (its `pom_tier_index` is None pre-H2) — it idles, no wasted bandwidth.
     let specs_v2 = filter_specs_by_vram(
-        keryx_miner::models::specs_for(keryx_miner::models::OPOI_V2_ACTIVATION_DAA, tier),
+        keryx_miner::models::specs_for(keryx_miner::models::VERY_LIGHT_ACTIVATION_DAA, tier),
     );
     // PoM: pick the highest tier this miner serves that has a pinned R_T (the model it will
     // mine under possession). Captured before `specs_v2` is consumed; the index is built after
@@ -512,28 +457,16 @@ async fn main() -> Result<(), Error> {
     } else {
         None
     };
+    // Serve the uncensored lineup from the start. set_v2_lineup keeps the readiness-gated
+    // crossing swap a consistent no-op (it would swap v2 -> v2).
     keryx_miner::slm::set_v2_lineup(specs_v2);
-    keryx_miner::slm::init_supported(specs_v1);
+    keryx_miner::slm::init_supported(specs_v2);
     log::debug!(
-        "OPoI Phase-3 active — {} legacy + {} uncensored model(s) staged, DAA-gated at {}.",
-        specs_v1.len(),
+        "OPoI Phase-3 active — {} uncensored model(s) staged (legacy lineup dropped, post-fork).",
         specs_v2.len(),
-        keryx_miner::models::OPOI_V2_ACTIVATION_DAA
     );
-    // Block on BOTH lineups before mining: never start hashing while a model this miner
-    // will serve — the legacy set now AND the uncensored set after the hardfork swap — is
-    // still downloading. The readiness-gated swap then activates v2 instantly at H.
-    match tokio::task::spawn_blocking(move || keryx_miner::slm::prefetch_models(specs_v1)).await {
-        Ok(Ok(())) => log::debug!("Legacy model files ready."),
-        Ok(Err(e)) => {
-            error!("Model prefetch failed — refusing to mine without inference capability: {}", e);
-            return Err(e.into());
-        }
-        Err(e) => {
-            error!("Model prefetch task panicked: {}", e);
-            return Err(e.into());
-        }
-    }
+    // Block until the uncensored lineup is fully downloaded before mining: never start hashing
+    // while a model this miner will serve is still downloading.
     match tokio::task::spawn_blocking(move || keryx_miner::slm::prefetch_models(specs_v2)).await {
         Ok(Ok(())) => info!("Model files ready — starting mining."),
         Ok(Err(e)) => {

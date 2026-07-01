@@ -17,8 +17,6 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 
-use hex;
-
 fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
     #[cfg(target_family = "unix")]
     {
@@ -589,8 +587,13 @@ impl WeightIndex {
         let batch_size = 1u64 << k; // 64 for K=6
 
         let mut writer = BufWriter::new(
-            OpenOptions::new().read(true).write(true).create(true).truncate(true)
-                .open(&tree_path).map_err(candle_core::Error::wrap)?,
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&tree_path)
+                .map_err(candle_core::Error::wrap)?,
         );
 
         let mut table: Vec<(u64, u64)> = Vec::with_capacity(names.len());
@@ -626,8 +629,6 @@ impl WeightIndex {
         if n_chunks == 0 {
             return Err(candle_core::Error::Msg("PoM: model produced 0 chunks".into()));
         }
-        eprintln!("PoM: {} chunks hashed → level-{} checkpoint nodes written ({:.1} GB reduced from {:.1} GB leaves)",
-            n_chunks, k, batch_size as f64 * 32.0 / 1e9, n_chunks as f64 * 32.0 / 1e9);
 
         // Build higher checkpoint levels (2K, 3K, ..., root) from level-K nodes.
         writer.flush().map_err(candle_core::Error::wrap)?;
@@ -636,8 +637,6 @@ impl WeightIndex {
 
         let gguf = File::open(path).map_err(candle_core::Error::wrap)?;
         let tree_file = File::open(&tree_path).map_err(candle_core::Error::wrap)?;
-        eprintln!("PoM: index build complete ({} chunks, {} total levels, {} stored checkpoints, root={})",
-            n_chunks, total_levels, checkpoints.len(), hex::encode(&r_t[..4]));
         Ok(WeightIndex {
             n_chunks,
             r_t,
@@ -1152,7 +1151,8 @@ mod tests {
         let nonce = 0xabc;
         let seed = pom_block_seed(&pph, 111, nonce);
 
-        let proof = build_proof(2, &pph, nonce, seed, idx.n_chunks, k, t, |o| idx.read_chunk(o), |o| idx.merkle_path(o));
+        let proof =
+            build_proof(2, &pph, nonce, seed, idx.n_chunks, k, t, |o| idx.read_chunk(o), |o| idx.merkle_path(o));
         assert!(verify_proof(&pph, nonce, seed, &proof, idx.n_chunks, k, t, &idx.r_t, &[0xff; 32]));
         // borsh wire-format round-trips (same encoding the node decodes).
         let bytes = borsh::to_vec(&proof).unwrap();
@@ -1168,9 +1168,16 @@ mod tests {
         let pph = blake(b"pph2");
         let nonce = 7;
         let seed = pom_block_seed(&pph, 1, nonce);
-        let proof = build_proof(0, &pph, nonce, seed, idx.n_chunks, k, t, |o| idx.read_chunk(o), |o| idx.merkle_path(o));
-        assert!(!verify_proof(&pph, nonce, seed, &proof, idx.n_chunks, k, t, &idx.r_t, &[0u8; 32]), "zero target must fail");
-        assert!(!verify_proof(&pph, nonce, seed, &proof, idx.n_chunks, k, t, &blake(b"wrong"), &[0xff; 32]), "wrong R_T must fail");
+        let proof =
+            build_proof(0, &pph, nonce, seed, idx.n_chunks, k, t, |o| idx.read_chunk(o), |o| idx.merkle_path(o));
+        assert!(
+            !verify_proof(&pph, nonce, seed, &proof, idx.n_chunks, k, t, &idx.r_t, &[0u8; 32]),
+            "zero target must fail"
+        );
+        assert!(
+            !verify_proof(&pph, nonce, seed, &proof, idx.n_chunks, k, t, &blake(b"wrong"), &[0xff; 32]),
+            "wrong R_T must fail"
+        );
     }
 
     #[test]
@@ -1198,8 +1205,8 @@ mod tests {
         let idx = WeightIndex::build_from_gguf(path).expect("build index");
         assert_eq!(idx.n_chunks, 77_604_776, "chunk count must match pinned GEMMA_3_4B_POM_CHUNKS");
         let pinned: [u8; 32] = [
-            0x84, 0x6c, 0xaa, 0x40, 0x0c, 0xf0, 0x14, 0x13, 0x21, 0x18, 0x49, 0x5d, 0x22, 0xe4, 0xbf, 0xa2,
-            0x42, 0x45, 0x4e, 0xac, 0x0d, 0x83, 0x5c, 0x3f, 0x8e, 0x63, 0x47, 0xd0, 0x13, 0x9d, 0x1b, 0x7e,
+            0x84, 0x6c, 0xaa, 0x40, 0x0c, 0xf0, 0x14, 0x13, 0x21, 0x18, 0x49, 0x5d, 0x22, 0xe4, 0xbf, 0xa2, 0x42, 0x45,
+            0x4e, 0xac, 0x0d, 0x83, 0x5c, 0x3f, 0x8e, 0x63, 0x47, 0xd0, 0x13, 0x9d, 0x1b, 0x7e,
         ];
         assert_eq!(idx.r_t, pinned, "miner R_T must equal node-pinned GEMMA_3_4B_POM_ROOT");
 
@@ -1207,7 +1214,8 @@ mod tests {
         let pph = blake(b"gemma-pph");
         let nonce = 1234;
         let seed = pom_block_seed(&pph, 99, nonce);
-        let proof = build_proof(0, &pph, nonce, seed, idx.n_chunks, 256, 32, |o| idx.read_chunk(o), |o| idx.merkle_path(o));
+        let proof =
+            build_proof(0, &pph, nonce, seed, idx.n_chunks, 256, 32, |o| idx.read_chunk(o), |o| idx.merkle_path(o));
         assert!(verify_proof(&pph, nonce, seed, &proof, idx.n_chunks, 256, 32, &idx.r_t, &[0xff; 32]));
     }
 }

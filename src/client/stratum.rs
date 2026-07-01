@@ -426,8 +426,6 @@ impl StratumHandler {
                             self.block_template_ctr
                                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some((v + 1) % 10_000))
                                 .unwrap();
-                            // Match solo grpc.rs: advance lineup if the DAA crossed the hardfork.
-                            keryx_miner::slm::advance_lineup_if_due(daa_score as u64);
                             // OPoI hard gate (mirrors solo grpc.rs): no models ready = no mining.
                             if keryx_miner::slm::loaded_model_ids().is_empty() {
                                 if self.block_template_ctr.load(Ordering::SeqCst) % 200 == 0 {
@@ -466,8 +464,6 @@ impl StratumHandler {
                             self.block_template_ctr
                                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some((v + 1) % 10_000))
                                 .unwrap();
-                            // Match solo grpc.rs: advance lineup if the DAA crossed the hardfork.
-                            keryx_miner::slm::advance_lineup_if_due(daa_score as u64);
                             // OPoI hard gate (mirrors solo grpc.rs): no models ready = no mining.
                             if keryx_miner::slm::loaded_model_ids().is_empty() {
                                 if self.block_template_ctr.load(Ordering::SeqCst) % 200 == 0 {
@@ -495,8 +491,6 @@ impl StratumHandler {
                             self.block_template_ctr
                                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some((v + 1) % 10_000))
                                 .unwrap();
-                            // Short notify carries no daa_score — assume post-hardfork.
-                            keryx_miner::slm::advance_lineup_if_due(keryx_miner::models::OPOI_V2_ACTIVATION_DAA);
                             // OPoI hard gate (mirrors solo grpc.rs): no models ready = no mining.
                             if keryx_miner::slm::loaded_model_ids().is_empty() {
                                 if self.block_template_ctr.load(Ordering::SeqCst) % 200 == 0 {

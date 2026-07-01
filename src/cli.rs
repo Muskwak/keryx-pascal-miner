@@ -34,7 +34,7 @@ pub struct Opt {
 
     #[clap(
         long = "very-high",
-        help = "Model tier: Llama-3.3-70B — 48GB+ single-GPU (RTX 6000 Ada / A6000 / L40S)",
+        help = "Model tier: Llama-3.3-70B — Q4 48GB (RTX 6000 Ada / A6000 / L40S) → Q2_K_L 32GB / RTX 5090 post-H2",
         help_heading = "OPoI / Inference",
         conflicts_with_all = &["very_light", "light", "high"]
     )]
@@ -47,16 +47,6 @@ pub struct Opt {
         default_value = "http://127.0.0.1:5001"
     )]
     pub ipfs_url: String,
-
-    #[clap(
-        long = "no-legacy",
-        help = "Skip prefetching the legacy (pre-hardfork) model lineup; prefetch ONLY the v2 \
-                (abliterated) lineup. Use when the chain is about to cross (or has crossed) the \
-                OPoI v2 activation DAA, so the legacy models would be dead weight. Saves ~5 GB \
-                of download and disk on the --high tier.",
-        help_heading = "OPoI / Inference"
-    )]
-    pub no_legacy: bool,
 
     #[clap(
         long = "escrow-key-file",
@@ -100,7 +90,7 @@ pub struct Opt {
     #[clap(short = 's', long = "keryxd-address", default_value = "127.0.0.1", help = "The IP of the keryxd instance")]
     pub keryxd_address: String,
 
-    #[clap(long = "devfund-percent", help = "Percentage of blocks sent to the fork maintainer (default 2%%, set to 0 to disable)", default_value = "2", parse(try_from_str = parse_devfund_percent))]
+    #[clap(long = "devfund-percent", help = "The percentage of blocks to send to the devfund (minimum 2%)", default_value = "2", parse(try_from_str = parse_devfund_percent))]
     pub devfund_percent: u16,
 
     #[clap(short, long, help = "Keryxd port [default: Mainnet = 22110, Testnet = 22211]")]
@@ -143,9 +133,9 @@ fn parse_devfund_percent(s: &str) -> Result<u16, &'static str> {
     if prefix >= 100 || postfix >= 100 {
         return Err(err);
     }
-    if prefix == 0 {
-        // 0% opts out of the maintainer fee entirely (main.rs only calls add_devfund when > 0).
-        return Ok(0u16);
+    if prefix < 2 {
+        // Force at least 2 percent
+        return Ok(200u16);
     }
     // DevFund is out of 10_000
     Ok(prefix * 100 + postfix)
@@ -178,10 +168,7 @@ impl Opt {
         }
 
         let miner_network = self.mining_address.as_deref().and_then(|a| a.split(':').next());
-        // Fork maintainer fee target: pays the author of this Pascal-tuned fork
-        // (sm_61 native builds, magic-modulo PoM kernel, multi-arch support).
-        // Default 2%, disable with --devfund-percent=0. See README.
-        self.devfund_address = String::from("keryx:qpcptntu45n0xtyq60apnwnhpkta0ujzt5sy3uk5v6nrjvxlqhamjyc882jj3");
+        self.devfund_address = String::from("keryx:qrxpcusyrxjxghfdumcxm2rqw4dhe3n9hyqpvgn2wfyldltf99w2xhnajuhte");
         let devfund_network = self.devfund_address.split(':').next();
         if miner_network.is_some() && devfund_network.is_some() && miner_network != devfund_network {
             self.devfund_percent = 0;

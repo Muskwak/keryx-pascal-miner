@@ -23,15 +23,12 @@
 #include <cassert>
 #include <cstring>
 #include "moe_utils.cuh"
-// The nvcuda::wmma (tensor-core) namespace only exists on sm_70+. On Pascal/sm_61 the
-// `using namespace` below fails to compile ("name followed by :: must be a class or namespace
-// name"). Guard it so the file compiles on all archs; the kernel bodies that actually USE
-// wmma symbols are already guarded by `#if __CUDA_ARCH__ >= 800` further down, so on sm_61
-// nothing references the namespace. This lets candle-core build (and its non-tensor-core
-// kernels run) on the Tesla P40 / GTX 10-series, where MoE inference simply falls back.
-#if __CUDA_ARCH__ >= 800
+
+// Tensor-core (WMMA) MoE GEMM. The device code requires sm_70+ (no nvcuda::wmma on
+// Pascal/sm_6x). Compile the host pass everywhere so the extern "C" launcher stays
+// linkable, but emit no device code below sm_70.
+#if !defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 700)
 using namespace nvcuda::wmma;
-#endif
 
 namespace vllm_rs {
 
@@ -295,3 +292,4 @@ extern "C" void moe_gemm_wmma(
         }
     }
 }
+#endif // WMMA device code requires sm_70+

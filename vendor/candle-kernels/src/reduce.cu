@@ -669,59 +669,13 @@ SOFTMAX_OP(__half, float, softmax_f16)
 RMSNORM_OP(__half, rmsnorm_f16)
 LAYERNORM_OP(__half, layernorm_f16)
 ROPE_OP(__half, rope_f16, rope_i_f16, rope_thd_f16)
-// atomicAdd(__half*, __half) is only available on sm_70+. On Pascal (sm_61) we fall back to a
-// CAS spin-loop so the sum_f16 reduction compiles and runs (slower, but correct). This keeps
-// f16 inference reductions functional on the Tesla P40 / GTX 10-series.
+FAST_OP(__half, fast_min_f16, fast_max_f16, fast_argmin_f16, fast_argmax_f16, fast_sum_f16)
+#endif
+
+// SUM_OP for __half uses atomicAdd(__half*), which is only available on sm_70+.
+// Guard it out on Pascal/sm_6x so the kernel set compiles for those archs.
 #if __CUDA_ARCH__ >= 700
 SUM_OP(__half, sum_f16)
-#else
-__device__ __forceinline__ void atomic_add_half(__half *addr, __half val) {
-  unsigned int *addr_as_uint = (unsigned int *)addr;
-  unsigned int old = *addr_as_uint;
-  unsigned int assumed;
-  do {
-    assumed = old;
-    __half new_val = __float2half(__half2float(__half((unsigned short)old)) + __half2float(val));
-    unsigned int new_uint = (unsigned int)*(unsigned short *)&new_val | (old & 0xFFFF0000u);
-    unsigned int r = atomicCAS(addr_as_uint, assumed, new_uint);
-    old = r;
-  } while (assumed != old);
-}
-#define SUM_OP_HALF_FALLBACK
-extern "C" __global__ void sum_f16(
-    const size_t numel, const size_t num_dims, const size_t num_sum_dims,
-    const size_t *info, const __half *inp, __half *out) {
-  const size_t *dims = info;
-  const size_t *strides = info + num_dims;
-  const size_t *sum_dims_l = info + 2 * num_dims;
-  const size_t *sum_dims_s = info + 2 * num_dims + num_sum_dims;
-  if (is_contiguous(num_dims, dims, strides)) {
-    for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x; i < numel; i += blockDim.x * gridDim.x) {
-      size_t dst_index = i;
-      for (unsigned int nd = 0; nd < num_sum_dims; ++nd) {
-        size_t stride = sum_dims_s[nd];
-        size_t pre = dst_index / stride;
-        size_t post = dst_index % stride;
-        dst_index = (pre / sum_dims_l[nd]) * stride + post;
-      }
-      atomic_add_half(out + dst_index, inp[i]);
-    }
-  } else {
-    for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x; i < numel; i += blockDim.x * gridDim.x) {
-      unsigned strided_i = get_strided_index(i, num_dims, dims, strides);
-      size_t dst_index = i;
-      for (unsigned int nd = 0; nd < num_sum_dims; ++nd) {
-        size_t stride = sum_dims_s[nd];
-        size_t pre = dst_index / stride;
-        size_t post = dst_index % stride;
-        dst_index = (pre / sum_dims_l[nd]) * stride + post;
-      }
-      atomic_add_half(out + dst_index, inp[strided_i]);
-    }
-  }
-}
-#endif
-FAST_OP(__half, fast_min_f16, fast_max_f16, fast_argmin_f16, fast_argmax_f16, fast_sum_f16)
 #endif
 
 SUM_OP(float, sum_f32)

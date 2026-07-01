@@ -251,10 +251,8 @@ impl MinerManager {
             let gpu_work = box_.as_mut();
             (|| {
                 info!("Spawned Thread for GPU {}", gpu_work.id());
-                // PR #9: this worker's CUDA ordinal, parsed from the gpu_work id format
-                // "#<N> (<name>)". Falls back to 0 (single-GPU / unparseable) so existing setups
-                // behave exactly as before.
-                let worker_device_id = gpu_work.id()
+                let worker_device_id = gpu_work
+                    .id()
                     .strip_prefix('#')
                     .and_then(|s| s.split_whitespace().next())
                     .and_then(|s| s.parse::<u32>().ok())
@@ -267,7 +265,7 @@ impl MinerManager {
                 // ~24 MH/s GPU at ~5.8 BPS. 1<<20 lifts the ceiling to ~23 BPS while staying well
                 // above kernel-launch overhead (batch ≈ 43 ms at 24 MH/s).
                 let mut pom_nonce: u64 = thread_rng().next_u64();
-                const POM_BATCH: u64 = 1 << 21;
+                const POM_BATCH: u64 = 1 << 20;
 
                 loop {
                     nonces[0] = 0;
